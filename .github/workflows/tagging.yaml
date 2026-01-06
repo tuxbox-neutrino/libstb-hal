@@ -14,6 +14,11 @@ permissions:
 jobs:
   tag:
     runs-on: ubuntu-latest
+    env:
+      GIT_AUTHOR_NAME: "Thilo Graf"
+      GIT_AUTHOR_EMAIL: "dbt@novatux.de"
+      GIT_COMMITTER_NAME: "Thilo Graf"
+      GIT_COMMITTER_EMAIL: "dbt@novatux.de"
 
     steps:
       - name: Checkout code
@@ -42,8 +47,10 @@ jobs:
 
       - name: Configure git identity
         run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "GitHub Actions"
+          git config user.email "dbt@novatux.de"
+          git config user.name "Thilo Graf"
+          git config --global user.email "dbt@novatux.de"
+          git config --global user.name "Thilo Graf"
 
       - name: Tagging
         run: |
@@ -51,8 +58,6 @@ jobs:
 
       - name: Commit and push changes
         run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "GitHub Actions"
           git add configure.ac
           git commit -m "tagging: Automatically updated tags [skip ci]" || echo "No changes to commit"
           git push
