@@ -1,6 +1,7 @@
 name: Tagging Workflow
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - mpx
