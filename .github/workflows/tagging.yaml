@@ -29,19 +29,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install GitPython
-          curl -o tagit.py https://raw.githubusercontent.com/dbt1/tagit/master/tagit.py
-          chmod +x tagit.py
+          curl -o /tmp/tagit.py https://raw.githubusercontent.com/dbt1/tagit/master/tagit.py
+          chmod +x /tmp/tagit.py
 
       - name: Verify tagit.py download
         run: |
-          if [ ! -f tagit.py ]; then
+          if [ ! -f /tmp/tagit.py ]; then
             echo "tagit.py was not downloaded!"
             exit 1
           fi
 
       - name: Tagging
         run: |
-          python tagit.py -f configure.ac
+          python /tmp/tagit.py -f configure.ac
 
       - name: Commit and push changes
         run: |
