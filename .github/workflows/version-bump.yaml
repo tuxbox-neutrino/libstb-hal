@@ -1,0 +1,76 @@
+name: Configure Version Micro Bump
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - mpx
+    paths-ignore:
+      - ".github/**"
+      - "configure.ac"
+
+concurrency:
+  group: configure-version-bump-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Setup tagit
+        id: setup
+        uses: ./.github/actions/setup-tagit
+
+      - name: Bump configure.ac micro version
+        run: |
+          set -euo pipefail
+
+          ver_major="${{ steps.setup.outputs.ver_major }}"
+          ver_minor="${{ steps.setup.outputs.ver_minor }}"
+          ver_micro="${{ steps.setup.outputs.ver_micro }}"
+
+          anchor_tag="${ver_major}.${ver_minor}"
+          if ! git rev-parse -q --verify "refs/tags/${anchor_tag}" >/dev/null; then
+            echo "::error::Missing version line tag ${anchor_tag}. Run the version-line workflow first."
+            exit 1
+          fi
+
+          commit_count=$(git rev-list --count "${anchor_tag}"..HEAD)
+          target_patch=$((commit_count + 1))
+          echo "Bumping configure.ac from ${ver_major}.${ver_minor}.${ver_micro} to ${ver_major}.${ver_minor}.${target_patch}"
+
+          before_head=$(git rev-parse HEAD)
+          python /tmp/tagit.py \
+            -f configure.ac \
+            --scheme-file tagit-config.json \
+            --version-mode increment \
+            --tag-format "{major}.{minor}.{patch}" \
+            --major "$ver_major" \
+            --minor "$ver_minor" \
+            --patch "$target_patch" \
+            --no-tag
+
+          after_head=$(git rev-parse HEAD)
+          if [ "$after_head" != "$before_head" ]; then
+            git reset --soft "$before_head"
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git add configure.ac
+          git diff --cached --quiet && {
+            echo "No changes to commit"
+            exit 0
+          }
+          git commit -m "build (ci): bump configure.ac version [skip ci]"
+          git push origin HEAD:${GITHUB_REF_NAME}
