@@ -27,8 +27,8 @@ void hal_get_lib_version(hal_libversion_t *ver)
 	//init struct
 	*ver = {"", 0, 0, 0, "", "", ""};
 
-#ifdef VERSION
-	ver->vVersion = VERSION;
+#ifdef PACKAGE_VERSION
+	ver->vVersion = PACKAGE_VERSION;
 #endif
 #ifdef PACKAGE_VERSION_MAJOR
 	ver->vMajor = PACKAGE_VERSION_MAJOR;
