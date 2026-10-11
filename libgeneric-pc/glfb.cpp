@@ -38,6 +38,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/input.h>
+#include <climits>
+#include <mpv/render_gl.h>
 #include "glfb_priv.h"
 #include "video_lib.h"
 #include "audio_lib.h"
@@ -52,6 +54,8 @@
 
 extern cVideo *videoDecoder;
 extern cAudio *audioDecoder;
+extern int sleep_us;
+extern bool HAL_live_mpv;
 
 /* the private class that does stuff only needed inside libstb-hal.
  * is used e.g. by cVideo... */
@@ -70,6 +74,7 @@ GLFramebuffer::GLFramebuffer(int x, int y)
 GLFramebuffer::~GLFramebuffer()
 {
 	glfb_priv->mShutDown = true;
+	glfb_priv->wake();
 	join();
 	delete glfb_priv;
 	glfb_priv = NULL;
@@ -101,6 +106,13 @@ GLFbPC::GLFbPC(int x, int y, std::vector<unsigned char> &buf): mReInit(true), mS
 
 	mState.blit = true;
 	last_apts = 0;
+	mUserEvent = 0;
+	mViewX = mViewY = 0;
+	mRender = NULL;
+	mVideoFbo = mVideoTex = 0;
+	mVideoW = mVideoH = 0;
+	mVideoValid = false;
+	mFramePending = false;
 
 	/* linux framebuffer compat mode */
 	si.bits_per_pixel = 32;
@@ -135,71 +147,80 @@ GLFbPC::~GLFbPC()
 
 void GLFbPC::initKeys()
 {
-	/*
-	   Keep in sync with initKeys() in clutterfb.cpp
-	*/
+	mKeyMap[SDLK_UP]    = KEY_UP;
+	mKeyMap[SDLK_DOWN]  = KEY_DOWN;
+	mKeyMap[SDLK_LEFT]  = KEY_LEFT;
+	mKeyMap[SDLK_RIGHT] = KEY_RIGHT;
 
-	mSpecialMap[GLUT_KEY_UP]    = KEY_UP;
-	mSpecialMap[GLUT_KEY_DOWN]  = KEY_DOWN;
-	mSpecialMap[GLUT_KEY_LEFT]  = KEY_LEFT;
-	mSpecialMap[GLUT_KEY_RIGHT] = KEY_RIGHT;
+	mKeyMap[SDLK_F1]  = KEY_RED;
+	mKeyMap[SDLK_F2]  = KEY_GREEN;
+	mKeyMap[SDLK_F3]  = KEY_YELLOW;
+	mKeyMap[SDLK_F4]  = KEY_BLUE;
 
-	mSpecialMap[GLUT_KEY_F1]  = KEY_RED;
-	mSpecialMap[GLUT_KEY_F2]  = KEY_GREEN;
-	mSpecialMap[GLUT_KEY_F3]  = KEY_YELLOW;
-	mSpecialMap[GLUT_KEY_F4]  = KEY_BLUE;
+	mKeyMap[SDLK_F5]  = KEY_RECORD;
+	mKeyMap[SDLK_F6]  = KEY_PLAY;
+	mKeyMap[SDLK_F7]  = KEY_PAUSE;
+	mKeyMap[SDLK_F8]  = KEY_STOP;
 
-	mSpecialMap[GLUT_KEY_F5]  = KEY_RECORD;
-	mSpecialMap[GLUT_KEY_F6]  = KEY_PLAY;
-	mSpecialMap[GLUT_KEY_F7]  = KEY_PAUSE;
-	mSpecialMap[GLUT_KEY_F8]  = KEY_STOP;
+	mKeyMap[SDLK_F9]  = KEY_FORWARD;
+	mKeyMap[SDLK_F10] = KEY_REWIND;
+	mKeyMap[SDLK_F11] = KEY_NEXT;
+	mKeyMap[SDLK_F12] = KEY_PREVIOUS;
 
-	mSpecialMap[GLUT_KEY_F9]  = KEY_FORWARD;
-	mSpecialMap[GLUT_KEY_F10] = KEY_REWIND;
-	mSpecialMap[GLUT_KEY_F11] = KEY_NEXT;
-	mSpecialMap[GLUT_KEY_F12] = KEY_PREVIOUS;
+	mKeyMap[SDLK_PAGEUP]   = KEY_PAGEUP;
+	mKeyMap[SDLK_PAGEDOWN] = KEY_PAGEDOWN;
 
-	mSpecialMap[GLUT_KEY_PAGE_UP]   = KEY_PAGEUP;
-	mSpecialMap[GLUT_KEY_PAGE_DOWN] = KEY_PAGEDOWN;
+	mKeyMap[SDLK_RETURN]   = KEY_OK;
+	mKeyMap[SDLK_KP_ENTER] = KEY_OK;
+	mKeyMap[SDLK_ESCAPE]   = KEY_EXIT;
 
-	mKeyMap[0x0d] = KEY_OK;
-	mKeyMap[0x1b] = KEY_EXIT;
+	mKeyMap[SDLK_0] = KEY_0;
+	mKeyMap[SDLK_1] = KEY_1;
+	mKeyMap[SDLK_2] = KEY_2;
+	mKeyMap[SDLK_3] = KEY_3;
+	mKeyMap[SDLK_4] = KEY_4;
+	mKeyMap[SDLK_5] = KEY_5;
+	mKeyMap[SDLK_6] = KEY_6;
+	mKeyMap[SDLK_7] = KEY_7;
+	mKeyMap[SDLK_8] = KEY_8;
+	mKeyMap[SDLK_9] = KEY_9;
+	mKeyMap[SDLK_KP_0] = KEY_0;
+	mKeyMap[SDLK_KP_1] = KEY_1;
+	mKeyMap[SDLK_KP_2] = KEY_2;
+	mKeyMap[SDLK_KP_3] = KEY_3;
+	mKeyMap[SDLK_KP_4] = KEY_4;
+	mKeyMap[SDLK_KP_5] = KEY_5;
+	mKeyMap[SDLK_KP_6] = KEY_6;
+	mKeyMap[SDLK_KP_7] = KEY_7;
+	mKeyMap[SDLK_KP_8] = KEY_8;
+	mKeyMap[SDLK_KP_9] = KEY_9;
 
-	mKeyMap['0'] = KEY_0;
-	mKeyMap['1'] = KEY_1;
-	mKeyMap['2'] = KEY_2;
-	mKeyMap['3'] = KEY_3;
-	mKeyMap['4'] = KEY_4;
-	mKeyMap['5'] = KEY_5;
-	mKeyMap['6'] = KEY_6;
-	mKeyMap['7'] = KEY_7;
-	mKeyMap['8'] = KEY_8;
-	mKeyMap['9'] = KEY_9;
-
-	mKeyMap['+'] = KEY_VOLUMEUP;
-	mKeyMap['-'] = KEY_VOLUMEDOWN;
-	mKeyMap['.'] = KEY_MUTE;
-	mKeyMap['a'] = KEY_AUDIO;
-	mKeyMap['e'] = KEY_EPG;
-	//     ['f']   is reserved to toggle fullscreen;
-	mKeyMap['g'] = KEY_GAMES;
-	mKeyMap['h'] = KEY_HELP;
-	mKeyMap['i'] = KEY_INFO;
-	mKeyMap['m'] = KEY_MENU;
-	mKeyMap['p'] = KEY_POWER;
-	mKeyMap['r'] = KEY_RADIO;
-	mKeyMap['s'] = KEY_SUBTITLE;
-	mKeyMap['t'] = KEY_TV;
-	mKeyMap['v'] = KEY_VIDEO;
-	mKeyMap['z'] = KEY_SLEEP;
+	mKeyMap[SDLK_PLUS]     = KEY_VOLUMEUP;
+	mKeyMap[SDLK_KP_PLUS]  = KEY_VOLUMEUP;
+	mKeyMap[SDLK_MINUS]    = KEY_VOLUMEDOWN;
+	mKeyMap[SDLK_KP_MINUS] = KEY_VOLUMEDOWN;
+	mKeyMap[SDLK_PERIOD]   = KEY_MUTE;
+	mKeyMap[SDLK_A] = KEY_AUDIO;
+	mKeyMap[SDLK_E] = KEY_EPG;
+	//     [SDLK_F]  is reserved to toggle fullscreen;
+	mKeyMap[SDLK_G] = KEY_GAMES;
+	mKeyMap[SDLK_H] = KEY_HELP;
+	mKeyMap[SDLK_I] = KEY_INFO;
+	mKeyMap[SDLK_M] = KEY_MENU;
+	mKeyMap[SDLK_P] = KEY_POWER;
+	mKeyMap[SDLK_R] = KEY_RADIO;
+	mKeyMap[SDLK_S] = KEY_SUBTITLE;
+	mKeyMap[SDLK_T] = KEY_TV;
+	mKeyMap[SDLK_V] = KEY_VIDEO;
+	mKeyMap[SDLK_Z] = KEY_SLEEP;
 
 	/* text editing inside input dialogs: raw codes, turned back into
 	 * glyphs and edit actions by neutrino (CRCInput::getUnicodeValue()
 	 * and the RC_backspace handlers) */
-	mKeyMap[0x08] = KEY_BACKSPACE;
-	mKeyMap[0x20] = KEY_SPACE;
+	mKeyMap[SDLK_BACKSPACE] = KEY_BACKSPACE;
+	mKeyMap[SDLK_SPACE]     = KEY_SPACE;
 
-	/* shift keys */
+	/* shift keys, they arrive as upper case text */
 	mKeyMap['F'] = KEY_FAVORITES;
 	mKeyMap['M'] = KEY_MODE;
 	mKeyMap['S'] = KEY_SAT;
@@ -209,171 +230,272 @@ void GLFbPC::initKeys()
 
 void GLFramebuffer::run()
 {
-	int argc = 1;
 	int x = glfb_priv->mState.width;
 	int y = glfb_priv->mState.height;
-	/* some dummy commandline for GLUT to be happy */
-	char const *argv[2] = { "neutrino", 0 };
 	hal_info("GLFB: GL thread starting x %d y %d\n", x, y);
-	glutInit(&argc, const_cast<char **>(argv));
-	glutInitWindowSize(x, y);
-	glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_DEPTH);
-	glutCreateWindow("Neutrino");
+	SDL_SetAppMetadata("Neutrino", NULL, "neutrino");
+	if (!SDL_Init(SDL_INIT_VIDEO))
+	{
+		hal_info("GLFB: SDL_Init failed: %s\n", SDL_GetError());
+		_exit(1); /* Life is hard */
+	}
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+	SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
+	if (glfb_priv->mFullscreen)
+		flags |= SDL_WINDOW_FULLSCREEN;
+	glfb_priv->mWindow = SDL_CreateWindow("Neutrino", x, y, flags);
+	if (!glfb_priv->mWindow)
+	{
+		hal_info("GLFB: SDL_CreateWindow failed: %s\n", SDL_GetError());
+		_exit(1);
+	}
+	glfb_priv->mContext = SDL_GL_CreateContext(glfb_priv->mWindow);
+	if (!glfb_priv->mContext)
+	{
+		hal_info("GLFB: SDL_GL_CreateContext failed: %s\n", SDL_GetError());
+		_exit(1);
+	}
+	SDL_GL_MakeCurrent(glfb_priv->mWindow, glfb_priv->mContext);
+	/* swap in step with the display; on KMS an unthrottled swap queues buffers faster than they are flipped */
+	if (!SDL_GL_SetSwapInterval(1))
+		hal_info("GLFB: SDL_GL_SetSwapInterval: %s\n", SDL_GetError());
+	SDL_HideCursor();
+	/* printable keys come in as text, translated with the keyboard layout of
+	 * the compositor or, on KMS, of the console */
+	SDL_StartTextInput(glfb_priv->mWindow);
 	/* 32bit FB depth, *2 because tuxtxt uses a shadow buffer */
 	int fbmem = x * y * 4 * 2;
 	osd_buf.resize(fbmem);
 	hal_info("GLFB: OSD buffer set to %d bytes at 0x%p\n", fbmem, osd_buf.data());
 	glfb_priv->mInitDone = true; /* signal that setup is finished */
 
-	/* init the good stuff */
-	GLenum err = glewInit();
-	if (err == GLEW_OK)
+	if (!glfb_priv->setupGLObjects())
 	{
-		if ((!GLEW_VERSION_1_5) || (!GLEW_EXT_pixel_buffer_object) || (!GLEW_ARB_texture_non_power_of_two))
-		{
-			hal_info("GLFB: Sorry, your graphics card is not supported. "
-				"Needs at least OpenGL 1.5, pixel buffer objects and NPOT textures.\n");
-			hal_info("incompatible graphics card: %m");
-			_exit(1); /* Life is hard */
-		}
-		else
-		{
-			glutSetCursor(GLUT_CURSOR_NONE);
-			glutDisplayFunc(GLFbPC::rendercb);
-			glutKeyboardFunc(GLFbPC::keyboardcb);
-			glutSpecialFunc(GLFbPC::specialcb);
-			glutReshapeFunc(GLFbPC::resizecb);
-			glfb_priv->setupGLObjects(); /* needs GLEW prototypes */
-			glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_CONTINUE_EXECUTION);
-			glutMainLoop();
-			glfb_priv->releaseGLObjects();
-		}
+		hal_info("GLFB: could not set up the OpenGL ES 2.0 objects\n");
+		_exit(1);
 	}
-	else
-		hal_info("GLFB: error initializing glew: %d\n", err);
+	glfb_priv->mUserEvent = SDL_RegisterEvents(1);
+	glfb_priv->setupRender();
+	/* the shutdown joins this thread, so its signal must not land here */
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGTERM);
+	sigaddset(&set, SIGINT);
+	pthread_sigmask(SIG_BLOCK, &set, NULL);
+	while (!glfb_priv->mShutDown)
+	{
+		glfb_priv->pollEvents();
+		glfb_priv->render();
+	}
+	glfb_priv->teardownRender();
+	glfb_priv->releaseGLObjects();
+	SDL_GL_DestroyContext(glfb_priv->mContext);
+	SDL_DestroyWindow(glfb_priv->mWindow);
+	SDL_Quit();
 	hal_info("GLFB: GL thread stopping\n");
 }
 
-#if 0
-void GLFbPC::setupCtx()
-{
-	int argc = 1;
-	/* some dummy commandline for GLUT to be happy */
-	char const *argv[2] = { "neutrino", 0 };
-	hal_info("GLFB: GL thread starting x %d y %d\n", mX[0], mY[0]);
-	glutInit(&argc, const_cast<char **>(argv));
-	glutInitWindowSize(mX[0], mY[0]);
-	glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_DEPTH);
-	glutCreateWindow("Neutrino");
-}
+static const char *vertex_shader =
+	"attribute vec2 a_pos;\n"
+	"attribute vec2 a_tex;\n"
+	"uniform vec2 u_scale;\n"
+	"uniform float u_xproj;\n"
+	"varying vec2 v_tex;\n"
+	"void main()\n"
+	"{\n"
+	"	gl_Position = vec4(a_pos.x * u_scale.x * u_xproj, a_pos.y * u_scale.y, 0.0, 1.0);\n"
+	"	v_tex = a_tex;\n"
+	"}\n";
 
-void GLFbPC::setupOSDBuffer()
+/* the OSD and video buffers are BGRA, the texture is uploaded as RGBA */
+static const char *fragment_shader =
+	"precision mediump float;\n"
+	"uniform sampler2D u_tex;\n"
+	"uniform float u_bgra;\n"
+	"varying vec2 v_tex;\n"
+	"void main()\n"
+	"{\n"
+	"	vec4 c = texture2D(u_tex, v_tex);\n"
+	"	gl_FragColor = mix(c, c.bgra, u_bgra);\n"
+	"}\n";
+
+static GLuint compileShader(GLenum type, const char *source)
 {
-	/* the OSD buffer size can be decoupled from the actual
-	   window size since the GL can blit-stretch with no
-	   trouble at all, ah, the luxury of ignorance... */
-	// mMutex.lock();
-	if (mState.width && mState.height)
+	GLuint shader = glCreateShader(type);
+	glShaderSource(shader, 1, &source, NULL);
+	glCompileShader(shader);
+	GLint ok = GL_FALSE;
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+	if (!ok)
 	{
-		/* 32bit FB depth, *2 because tuxtxt uses a shadow buffer */
-		int fbmem = mState.width * mState.height * 4 * 2;
-		osd_buf->resize(fbmem);
-		hal_info("GLFB: OSD buffer set to %d bytes at 0x%p\n", fbmem, osd_buf->data());
+		char log[1024];
+		glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+		hal_info_c("GLFB::%s: shader compilation failed: %s\n", __func__, log);
+		glDeleteShader(shader);
+		return 0;
 	}
+	return shader;
 }
-#endif
 
-void GLFbPC::setupGLObjects()
+bool GLFbPC::setupGLObjects()
 {
-	unsigned char buf[4] = { 0, 0, 0, 0 }; /* 1 black pixel */
+	GLuint vs = compileShader(GL_VERTEX_SHADER, vertex_shader);
+	GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragment_shader);
+	if (!vs || !fs)
+		return false;
+	mState.program = glCreateProgram();
+	glAttachShader(mState.program, vs);
+	glAttachShader(mState.program, fs);
+	glLinkProgram(mState.program);
+	glDeleteShader(vs);
+	glDeleteShader(fs);
+	GLint ok = GL_FALSE;
+	glGetProgramiv(mState.program, GL_LINK_STATUS, &ok);
+	if (!ok)
+	{
+		char log[1024];
+		glGetProgramInfoLog(mState.program, sizeof(log), NULL, log);
+		hal_info("GLFB::%s: program link failed: %s\n", __func__, log);
+		return false;
+	}
+	mState.a_pos = glGetAttribLocation(mState.program, "a_pos");
+	mState.a_tex = glGetAttribLocation(mState.program, "a_tex");
+	mState.u_scale = glGetUniformLocation(mState.program, "u_scale");
+	mState.u_xproj = glGetUniformLocation(mState.program, "u_xproj");
+	mState.u_bgra = glGetUniformLocation(mState.program, "u_bgra");
+	mState.xproj = 1.0;
+	glUseProgram(mState.program);
+	glUniform1f(mState.u_bgra, 1.0);
+	glUniform1i(glGetUniformLocation(mState.program, "u_tex"), 0);
+	glActiveTexture(GL_TEXTURE0);
+
+	/* non power of two textures need clamping and no mipmaps in GLES2 */
 	glGenTextures(1, &mState.osdtex);
 	glGenTextures(1, &mState.displaytex);
 	glBindTexture(GL_TEXTURE_2D, mState.osdtex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, mState.width, mState.height, 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, mState.width, mState.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-	glBindTexture(GL_TEXTURE_2D, mState.displaytex); /* we do not yet know the size so will set that inline */
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-
-	glGenBuffers(1, &mState.pbo);
-	glGenBuffers(1, &mState.displaypbo);
-
-	/* hack to start with black video buffer instead of white */
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, mState.displaypbo);
-	glBufferData(GL_PIXEL_UNPACK_BUFFER, sizeof(buf), buf, GL_STREAM_DRAW_ARB);
+	/* we do not yet know the size of the video, start with 1 black pixel */
+	unsigned char buf[4] = { 0, 0, 0, 0 };
 	glBindTexture(GL_TEXTURE_2D, mState.displaytex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	return true;
 }
 
 
 void GLFbPC::releaseGLObjects()
 {
-	glDeleteBuffers(1, &mState.pbo);
-	glDeleteBuffers(1, &mState.displaypbo);
 	glDeleteTextures(1, &mState.osdtex);
 	glDeleteTextures(1, &mState.displaytex);
+	glDeleteProgram(mState.program);
 }
 
 
-/* static */ void GLFbPC::rendercb()
+void GLFbPC::pollEvents()
 {
-	glfb_priv->render();
-}
-
-
-/* static */ void GLFbPC::keyboardcb(unsigned char key, int /*x*/, int /*y*/)
-{
-	hal_debug_c("GLFB::%s: 0x%x\n", __func__, key);
-	struct input_event ev;
-	if (key == 'f')
+	SDL_Event ev;
+	/* the software live TV decoder still paces the loop, everything else just waits */
+	int timeout = 250;
+	if (!HAL_live_mpv && !mVideoValid && videoDecoder)
+		timeout = sleep_us > 1000 ? sleep_us / 1000 : 1;
+	if (mFramePending)
+		timeout = 5;
+	if (!SDL_WaitEventTimeout(&ev, timeout))
+		return;
+	do
 	{
-		hal_info_c("GLFB::%s: toggle fullscreen %s\n", __func__, glfb_priv->mFullscreen ? "off" : "on");
-		glfb_priv->mFullscreen = !(glfb_priv->mFullscreen);
-		glfb_priv->mReInit = true;
+		switch (ev.type)
+		{
+			case SDL_EVENT_KEY_DOWN:
+				if (!producesText(ev.key.key))
+					handleKey(ev.key.key);
+				break;
+			case SDL_EVENT_TEXT_INPUT:
+				for (const char *c = ev.text.text; c && *c; c++)
+					if (*c > 0x20 && *c < 0x7f)
+						handleKey((SDL_Keycode)*c);
+					else if (*c == ' ')
+						handleKey(SDLK_SPACE);
+				break;
+			case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+				mReInit = true;
+				break;
+			case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+				mFullscreen = true;
+				mReInit = true;
+				break;
+			case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+				mFullscreen = false;
+				mReInit = true;
+				break;
+			case SDL_EVENT_QUIT:
+				/* the window is all there is of neutrino on a desktop, closing
+				 * it ends the program. This thread keeps drawing until the
+				 * shutdown that follows takes the framebuffer down. */
+				hal_info("GLFB::%s: window closed, shutting down\n", __func__);
+				kill(getpid(), SIGTERM);
+				break;
+			default:
+				break;
+		}
+	} while (SDL_PollEvent(&ev));
+}
+
+bool GLFbPC::producesText(SDL_Keycode key)
+{
+	if (key >= 0x20 && key < 0x7f)
+		return true;
+	switch (key)
+	{
+		case SDLK_KP_0: case SDLK_KP_1: case SDLK_KP_2: case SDLK_KP_3: case SDLK_KP_4:
+		case SDLK_KP_5: case SDLK_KP_6: case SDLK_KP_7: case SDLK_KP_8: case SDLK_KP_9:
+		case SDLK_KP_PLUS: case SDLK_KP_MINUS: case SDLK_KP_PERIOD:
+			return true;
+		default:
+			return false;
+	}
+}
+
+void GLFbPC::handleKey(SDL_Keycode key)
+{
+	hal_debug("GLFB::%s: 0x%x\n", __func__, (unsigned int)key);
+	if (key == SDLK_F)
+	{
+		hal_info("GLFB::%s: toggle fullscreen %s\n", __func__, mFullscreen ? "off" : "on");
+		/* the compositor answers with ENTER/LEAVE_FULLSCREEN and a new size */
+		SDL_SetWindowFullscreen(mWindow, !mFullscreen);
 		return;
 	}
-	std::map<unsigned char, int>::const_iterator i = glfb_priv->mKeyMap.find(key);
-	if (i == glfb_priv->mKeyMap.end())
+	std::map<SDL_Keycode, int>::const_iterator i = mKeyMap.find(key);
+	if (i == mKeyMap.end())
 		return;
-	ev.code = i->second;
-	ev.value = 1; /* key own */
-	ev.type = EV_KEY;
-	gettimeofday(&ev.time, NULL);
-	hal_debug_c("GLFB::%s: pushing 0x%x\n", __func__, ev.code);
-	write(glfb_priv->input_fd, &ev, sizeof(ev));
-	ev.value = 0; /* neutrino is stupid, so push key up directly after key down */
-	write(glfb_priv->input_fd, &ev, sizeof(ev));
-}
-
-/* static */ void GLFbPC::specialcb(int key, int /*x*/, int /*y*/)
-{
-	hal_debug_c("GLFB::%s: 0x%x\n", __func__, key);
-	struct input_event ev;
-	std::map<int, int>::const_iterator i = glfb_priv->mSpecialMap.find(key);
-	if (i == glfb_priv->mSpecialMap.end())
-		return;
-	ev.code = i->second;
-	ev.value = 1;
-	ev.type = EV_KEY;
-	gettimeofday(&ev.time, NULL);
-	hal_debug_c("GLFB::%s: pushing 0x%x\n", __func__, ev.code);
-	write(glfb_priv->input_fd, &ev, sizeof(ev));
-	ev.value = 0;
-	write(glfb_priv->input_fd, &ev, sizeof(ev));
+	struct input_event iev;
+	memset(&iev, 0, sizeof(iev));
+	iev.code = i->second;
+	iev.value = 1; /* key down */
+	iev.type = EV_KEY;
+	gettimeofday(&iev.time, NULL);
+	hal_debug("GLFB::%s: pushing 0x%x\n", __func__, iev.code);
+	write(input_fd, &iev, sizeof(iev));
+	iev.value = 0; /* neutrino is stupid, so push key up directly after key down */
+	write(input_fd, &iev, sizeof(iev));
 }
 
 int sleep_us = 30000;
 
 void GLFbPC::render()
 {
-	if (mShutDown)
-		glutLeaveMainLoop();
-
 	mReInitLock.lock();
 	if (mReInit)
 	{
@@ -383,45 +505,89 @@ void GLFbPC::render()
 		mReInit = false;
 		mX = &_mX[mFullscreen];
 		mY = &_mY[mFullscreen];
-		if (mFullscreen)
+		/* the compositor decides the window size, the picture is fitted into it */
+		int x = 0, y = 0;
+		SDL_GetWindowSizeInPixels(mWindow, &x, &y);
+		if (x <= 0 || y <= 0)
 		{
-			int x = glutGet(GLUT_SCREEN_WIDTH);
-			int y = glutGet(GLUT_SCREEN_HEIGHT);
-			*mX = x;
-			*mY = y;
-			AVRational a = { x, y };
-			if (av_cmp_q(a, mOA) < 0)
-				*mY = x * mOA.den / mOA.num;
-			else if (av_cmp_q(a, mOA) > 0)
-				*mX = y * mOA.num / mOA.den;
-			xoff = (x - *mX) / 2;
-			yoff = (y - *mY) / 2;
-			glutFullScreen();
+			x = mState.width;
+			y = mState.height;
 		}
-		else
-			*mX = *mY * mOA.num / mOA.den;
+		*mX = x;
+		*mY = y;
+		AVRational a = { x, y };
+		if (av_cmp_q(a, mOA) < 0)
+			*mY = x * mOA.den / mOA.num;
+		else if (av_cmp_q(a, mOA) > 0)
+			*mX = y * mOA.num / mOA.den;
+		xoff = (x - *mX) / 2;
+		yoff = (y - *mY) / 2;
 		hal_info("%s: reinit mX:%d mY:%d xoff:%d yoff:%d fs %d\n", __func__, *mX, *mY, xoff, yoff, mFullscreen);
+		mViewX = xoff;
+		mViewY = yoff;
 		glViewport(xoff, yoff, *mX, *mY);
-		glMatrixMode(GL_PROJECTION);
-		glLoadIdentity();
 		float aspect = static_cast<float>(*mX) / *mY;
 		float osdaspect = static_cast<float>(mOA.den) / mOA.num;
 
-		glOrtho(aspect * -osdaspect, aspect * osdaspect, -1.0, 1.0, -1.0, 1.0);
+		/* glOrtho(aspect * -osdaspect, aspect * osdaspect, -1.0, 1.0, -1.0, 1.0) */
+		mState.xproj = 1.0 / (aspect * osdaspect);
 		glClearColor(0.0, 0.0, 0.0, 1.0);
 
-		glMatrixMode(GL_MODELVIEW);
-		glLoadIdentity();
 		glEnable(GL_BLEND);
-		glEnable(GL_TEXTURE_2D);
 		glDisable(GL_DEPTH_TEST);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	}
 	mReInitLock.unlock();
-	if (!mFullscreen && (*mX != glutGet(GLUT_WINDOW_WIDTH) || *mY != glutGet(GLUT_WINDOW_HEIGHT)))
-		glutReshapeWindow(*mX, *mY);
 
-	bltDisplayBuffer(); /* decoded video stream */
+	uint64_t flags = mRender ? mpv_render_context_update(mRender) : 0;
+	restoreGLState();
+	cMpvEngine::VideoParams vp;
+	vp.valid = false;
+	cMpvEngine *engine = cMpvEngine::getInstance();
+	if (engine)
+		vp = engine->getVideoParams();
+	if (!vp.valid)
+		mVideoValid = false;
+	if (flags & MPV_RENDER_UPDATE_FRAME)
+	{
+		bool draw = engine && engine->renderBegin();
+		mFramePending = false;
+		if (draw && vp.valid)
+			renderVideo(vp);
+		else if (draw)
+		{
+			/* the frame is here before its size is: leave it where it is
+			 * and look again in a moment. It may be the only one, of a
+			 * file that was loaded paused. */
+			mFramePending = true;
+		}
+		else if (mRender)
+		{
+			/* a frame of a stream that is being replaced: tell mpv it is
+			 * dealt with, it would wait for it otherwise */
+			int skip = 1;
+			mpv_render_param params[2];
+			params[0].type = MPV_RENDER_PARAM_SKIP_RENDERING;
+			params[0].data = &skip;
+			params[1].type = MPV_RENDER_PARAM_INVALID;
+			params[1].data = NULL;
+			mpv_render_context_render(mRender, params);
+		}
+		if (engine)
+			engine->renderEnd();
+	}
+	if (mVideoValid)
+	{
+		AVRational a;
+		av_reduce(&a.num, &a.den, vp.w, vp.h, INT_MAX);
+		if (av_cmp_q(a, mVA))
+		{
+			mVA = a;
+			mVAchanged = true;
+		}
+	}
+	else
+		bltDisplayBuffer(); /* decoded video stream */
 	if (mState.blit)
 	{
 		/* only blit manually after fb->blit(), this helps to find missed blit() calls */
@@ -430,8 +596,9 @@ void GLFbPC::render()
 		bltOSDBuffer(); /* OSD */
 	}
 
-	glBindTexture(GL_TEXTURE_2D, mState.osdtex);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(mViewX, mViewY, *mX, *mY);
+	glClear(GL_COLOR_BUFFER_BIT);
 
 	if (mVAchanged)
 	{
@@ -487,49 +654,174 @@ void GLFbPC::render()
 				break;
 		}
 	}
-	glBindTexture(GL_TEXTURE_2D, mState.displaytex);
+	glUniform1f(mState.u_bgra, mVideoValid ? 0.0 : 1.0);
+	glBindTexture(GL_TEXTURE_2D, mVideoValid ? mVideoTex : mState.displaytex);
 	drawSquare(zoom, xscale);
+	glUniform1f(mState.u_bgra, 1.0);
 	glBindTexture(GL_TEXTURE_2D, mState.osdtex);
 	drawSquare(1.0, -100);
 
-	glFlush();
-	glutSwapBuffers();
+	SDL_GL_SwapWindow(mWindow);
+	if (flags & MPV_RENDER_UPDATE_FRAME)
+		mpv_render_context_report_swap(mRender);
 
 	GLuint err = glGetError();
 	if (err != 0)
 		hal_info("GLFB::%s: GLError:%d 0x%04x\n", __func__, err, err);
-	if (sleep_us > 0)
-		usleep(sleep_us);
-	glutPostRedisplay();
 }
 
-/* static */ void GLFbPC::resizecb(int w, int h)
+static void *glGetProc(void *, const char *name)
 {
-	glfb_priv->checkReinit(w, h);
+	return (void *)SDL_GL_GetProcAddress(name);
 }
 
-void GLFbPC::checkReinit(int x, int y)
+/* static */ void GLFbPC::renderUpdateCb(void *ctx)
 {
-	static int last_x = 0, last_y = 0;
+	((GLFbPC *)ctx)->wake();
+}
 
-	mReInitLock.lock();
-	if (!mFullscreen && !mReInit && (x != *mX || y != *mY))
+void GLFbPC::wake()
+{
+	if (!mUserEvent)
+		return;
+	SDL_Event ev;
+	SDL_zero(ev);
+	ev.type = mUserEvent;
+	SDL_PushEvent(&ev);
+}
+
+bool GLFbPC::setupRender()
+{
+	cMpvEngine *engine = cMpvEngine::getInstance();
+	if (!engine)
+		return false;
+	mpv_opengl_init_params gl = { glGetProc, NULL };
+	int advanced = 1;
+	/* vaapi needs the native display to create its VADisplay */
+	SDL_PropertiesID props = SDL_GetWindowProperties(mWindow);
+	void *wl = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
+	void *x11 = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, NULL);
+	mpv_opengl_drm_params_v2 drm = { -1, -1, -1, NULL, -1 };
+	mpv_render_param params[5];
+	int n = 0;
+	params[n].type = MPV_RENDER_PARAM_API_TYPE;
+	params[n++].data = const_cast<char *>(MPV_RENDER_API_TYPE_OPENGL);
+	params[n].type = MPV_RENDER_PARAM_OPENGL_INIT_PARAMS;
+	params[n++].data = &gl;
+	params[n].type = MPV_RENDER_PARAM_ADVANCED_CONTROL;
+	params[n++].data = &advanced;
+	if (wl)
 	{
-		if (x != *mX && abs(x - last_x) > 2)
-		{
-			*mX = x;
-			*mY = *mX * mOA.den / mOA.num;
-		}
-		else if (y != *mY && abs(y - last_y) > 2)
-		{
-			*mY = y;
-			*mX = *mY * mOA.num / mOA.den;
-		}
-		mReInit = true;
+		params[n].type = MPV_RENDER_PARAM_WL_DISPLAY;
+		params[n++].data = wl;
 	}
-	mReInitLock.unlock();
-	last_x = x;
-	last_y = y;
+	else if (x11)
+	{
+		params[n].type = MPV_RENDER_PARAM_X11_DISPLAY;
+		params[n++].data = x11;
+	}
+	else
+	{
+		/* KMS without a display server: vaapi opens the render node itself */
+		drm.render_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+		if (drm.render_fd >= 0)
+		{
+			params[n].type = MPV_RENDER_PARAM_DRM_DISPLAY_V2;
+			params[n++].data = &drm;
+		}
+	}
+	params[n].type = MPV_RENDER_PARAM_INVALID;
+	params[n].data = NULL;
+	int r = mpv_render_context_create(&mRender, engine->getHandle(), params);
+	if (r < 0)
+	{
+		hal_info("GLFB::%s: mpv_render_context_create failed: %s\n", __func__, mpv_error_string(r));
+		mRender = NULL;
+		return false;
+	}
+	mpv_render_context_set_update_callback(mRender, renderUpdateCb, this);
+	hal_info("GLFB::%s: libmpv render context ready (%s)\n", __func__, wl ? "wayland display" : x11 ? "x11 display" : drm.render_fd >= 0 ? "drm render node" : "no native display");
+	return true;
+}
+
+void GLFbPC::teardownRender()
+{
+	if (mRender)
+	{
+		mpv_render_context_set_update_callback(mRender, NULL, NULL);
+		mpv_render_context_free(mRender);
+		mRender = NULL;
+	}
+	if (mVideoFbo)
+		glDeleteFramebuffers(1, &mVideoFbo);
+	if (mVideoTex)
+		glDeleteTextures(1, &mVideoTex);
+	mVideoFbo = mVideoTex = 0;
+	mVideoValid = false;
+}
+
+void GLFbPC::renderVideo(const cMpvEngine::VideoParams &vp)
+{
+	if (!mVideoFbo || vp.w != mVideoW || vp.h != mVideoH)
+	{
+		if (!mVideoFbo)
+			glGenFramebuffers(1, &mVideoFbo);
+		if (!mVideoTex)
+			glGenTextures(1, &mVideoTex);
+		glBindTexture(GL_TEXTURE_2D, mVideoTex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vp.w, vp.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glBindFramebuffer(GL_FRAMEBUFFER, mVideoFbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mVideoTex, 0);
+		GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		if (status != GL_FRAMEBUFFER_COMPLETE)
+		{
+			hal_info("GLFB::%s: video FBO %dx%d incomplete: 0x%04x\n", __func__, vp.w, vp.h, status);
+			return;
+		}
+		mVideoW = vp.w;
+		mVideoH = vp.h;
+		hal_info("GLFB::%s: video FBO %dx%d\n", __func__, vp.w, vp.h);
+	}
+	mpv_opengl_fbo fbo = { (int)mVideoFbo, mVideoW, mVideoH, 0 };
+	int flip = 0;
+	mpv_render_param params[3];
+	params[0].type = MPV_RENDER_PARAM_OPENGL_FBO;
+	params[0].data = &fbo;
+	params[1].type = MPV_RENDER_PARAM_FLIP_Y;
+	params[1].data = &flip;
+	params[2].type = MPV_RENDER_PARAM_INVALID;
+	params[2].data = NULL;
+	int r = mpv_render_context_render(mRender, params);
+	if (r < 0)
+		hal_debug("GLFB::%s: mpv_render_context_render: %s\n", __func__, mpv_error_string(r));
+	else
+		mVideoValid = true;
+	restoreGLState();
+}
+
+/* mpv uses our GL context for its own objects and leaves its state behind */
+void GLFbPC::restoreGLState()
+{
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glUseProgram(mState.program);
+	glActiveTexture(GL_TEXTURE0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_STENCIL_TEST);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glBlendEquation(GL_FUNC_ADD);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glClearColor(0.0, 0.0, 0.0, 1.0);
 }
 
 void GLFbPC::drawSquare(float size, float x_factor)
@@ -541,8 +833,6 @@ void GLFbPC::drawSquare(float size, float x_factor)
 		-1.0f, -1.0f,
 		 1.0f, -1.0f,
 	};
-
-	GLubyte indices[] = { 0, 1, 2, 3 };
 
 	GLfloat texcoords[] =
 	{
@@ -580,29 +870,23 @@ void GLFbPC::drawSquare(float size, float x_factor)
 	else
 		x_factor = 1.0; /* OSD */
 
-	glPushMatrix();
-	glScalef(size * x_factor, size, size);
-	glEnableClientState(GL_VERTEX_ARRAY);
-	glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-	glVertexPointer(2, GL_FLOAT, 0, vertices);
-	glTexCoordPointer(2, GL_FLOAT, 0, texcoords);
-	glDrawElements(GL_QUADS, 4, GL_UNSIGNED_BYTE, indices);
-	glDisableClientState(GL_VERTEX_ARRAY);
-	glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-	glPopMatrix();
+	glUniform2f(mState.u_scale, size * x_factor, size);
+	glUniform1f(mState.u_xproj, mState.xproj);
+	glEnableVertexAttribArray(mState.a_pos);
+	glEnableVertexAttribArray(mState.a_tex);
+	glVertexAttribPointer(mState.a_pos, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+	glVertexAttribPointer(mState.a_tex, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+	glDisableVertexAttribArray(mState.a_pos);
+	glDisableVertexAttribArray(mState.a_tex);
 }
 
 
 void GLFbPC::bltOSDBuffer()
 {
 	/* FIXME: copy each time */
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, mState.pbo);
-	glBufferData(GL_PIXEL_UNPACK_BUFFER, osd_buf->size(), osd_buf->data(), GL_STREAM_DRAW_ARB);
-
 	glBindTexture(GL_TEXTURE_2D, mState.osdtex);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, mState.width, mState.height, GL_BGRA, GL_UNSIGNED_BYTE, 0);
-
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, mState.width, mState.height, GL_RGBA, GL_UNSIGNED_BYTE, osd_buf->data());
 }
 
 void GLFbPC::bltDisplayBuffer()
@@ -610,6 +894,20 @@ void GLFbPC::bltDisplayBuffer()
 	if (!videoDecoder) /* cannot start yet */
 		return;
 	static bool warn = true;
+	static bool still_shown = false;
+	if (HAL_live_mpv && !videoDecoder->stillpicture)
+	{
+		/* this texture only ever holds a still picture then; once that is
+		 * taken down, nothing of it may show up between two channels */
+		if (still_shown)
+		{
+			static const uint32_t black = 0xff000000;
+			glBindTexture(GL_TEXTURE_2D, mState.displaytex);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &black);
+			still_shown = false;
+		}
+		return;
+	}
 	cVideo::SWFramebuffer *buf = videoDecoder->getDecBuf();
 	if (!buf)
 	{
@@ -632,13 +930,11 @@ void GLFbPC::bltDisplayBuffer()
 		mVAchanged = true;
 	}
 
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, mState.displaypbo);
-	glBufferData(GL_PIXEL_UNPACK_BUFFER, buf->size(), &(*buf)[0], GL_STREAM_DRAW_ARB);
-
 	glBindTexture(GL_TEXTURE_2D, mState.displaytex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
-
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, &(*buf)[0]);
+	still_shown = true;
+	if (HAL_live_mpv)
+		return; /* nothing to pace, mpv does its own A/V sync */
 
 	/* "rate control" mechanism starts here...
 	 * this implementation is pretty naive and not working too well, but

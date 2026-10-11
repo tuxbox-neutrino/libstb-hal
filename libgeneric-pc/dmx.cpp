@@ -30,10 +30,14 @@
 #include <cstdio>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <OpenThreads/Mutex>
 #include "dmx_hal.h"
+#include "dmx_file.h"
 #include "hal_debug.h"
 
 #include "video_lib.h"
+#include "mpv_player.h"
 /* needed for getSTC... */
 extern cVideo *videoDecoder;
 
@@ -75,6 +79,41 @@ static int dmx_tp_count = 0;
 #define MAX_TS_COUNT 8
 
 extern bool HAL_nodec;
+extern bool HAL_live_mpv;
+
+/* what the generic backend keeps per demux */
+struct dmx_priv
+{
+	TsFileFilter *file;	/* fed from HAL_TSDMX_FILE */
+	bool live;		/* a PID for the mpv live session, nothing to read here */
+};
+#define PRIV ((dmx_priv *)pdata)
+
+/* With mpv doing live TV there is one transport stream for picture and
+ * sound, opened by the engine. The video, audio and PCR demux that zapit
+ * sets up only tell which PIDs that stream needs. */
+static OpenThreads::Mutex live_lock;
+static uint16_t live_pid[3];
+
+static int live_index(DMX_CHANNEL_TYPE t)
+{
+	switch (t)
+	{
+		case DMX_VIDEO_CHANNEL:    return 0;
+		case DMX_AUDIO_CHANNEL:    return 1;
+		case DMX_PCR_ONLY_CHANNEL: return 2;
+		default:                   return -1;
+	}
+}
+
+void hal_live_pids(uint16_t &vpid, uint16_t &apid, uint16_t &pcrpid)
+{
+	live_lock.lock();
+	vpid = live_pid[0];
+	apid = live_pid[1];
+	pcrpid = live_pid[2];
+	live_lock.unlock();
+}
 
 cDemux::cDemux(int n)
 {
@@ -86,6 +125,11 @@ cDemux::cDemux(int n)
 	else
 		num = n;
 	fd = -1;
+	pdata = NULL;
+	dmx_type = DMX_INVALID;
+	pid = 0;
+	flt = 0;
+	buffersize = 0;
 }
 
 cDemux::~cDemux()
@@ -104,6 +148,26 @@ bool cDemux::Open(DMX_CHANNEL_TYPE pes_type, void * /*hVideoBuffer*/, int uBuffe
 	dmx_type = pes_type;
 	if (pes_type != DMX_PSI_CHANNEL)
 		flags |= O_NONBLOCK;
+
+	if (!pdata)
+		pdata = new dmx_priv();
+	PRIV->file = NULL;
+	PRIV->live = false;
+	if (HAL_live_mpv && live_index(pes_type) >= 0)
+	{
+		PRIV->live = true;
+		return true;
+	}
+	if (tsfile_enabled())
+	{
+		PRIV->file = tsfile_open(pes_type == DMX_PSI_CHANNEL, uBufferSize, &fd);
+		if (!PRIV->file)
+			return false;
+		if (pes_type != DMX_PSI_CHANNEL)
+			fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+		buffersize = uBufferSize;
+		return true;
+	}
 
 	fd = open(devname[devnum], flags);
 	if (fd < 0)
@@ -142,6 +206,27 @@ bool cDemux::Open(DMX_CHANNEL_TYPE pes_type, void * /*hVideoBuffer*/, int uBuffe
 void cDemux::Close(void)
 {
 	hal_debug("%s #%d, fd = %d\n", __FUNCTION__, num, fd);
+	if (pdata)
+	{
+		bool done = PRIV->live || PRIV->file;
+		if (PRIV->live)
+		{
+			live_lock.lock();
+			live_pid[live_index(dmx_type)] = 0;
+			live_lock.unlock();
+		}
+		if (PRIV->file)
+		{
+			tsfile_close(PRIV->file);
+			close(fd);
+			fd = -1;
+			pesfds.clear();
+		}
+		delete PRIV;
+		pdata = NULL;
+		if (done)
+			return;
+	}
 	if (fd < 0)
 	{
 		hal_info("%s #%d: not open!\n", __FUNCTION__, num);
@@ -166,6 +251,13 @@ void cDemux::Close(void)
 bool cDemux::Start(bool)
 {
 	hal_debug("%s #%d fd: %d type: %s\n", __func__, num, fd, DMX_T[dmx_type]);
+	if (pdata && PRIV->live)
+		return true;
+	if (pdata && PRIV->file)
+	{
+		tsfile_start(PRIV->file);
+		return true;
+	}
 	if (fd < 0)
 	{
 		hal_info("%s #%d: not open!\n", __FUNCTION__, num);
@@ -178,6 +270,22 @@ bool cDemux::Start(bool)
 bool cDemux::Stop(void)
 {
 	hal_debug("%s #%d fd: %d type: %s\n", __func__, num, fd, DMX_T[dmx_type]);
+	if (pdata && PRIV->live)
+	{
+		live_lock.lock();
+		live_pid[live_index(dmx_type)] = 0;
+		live_lock.unlock();
+		return true;
+	}
+	if (pdata && PRIV->file)
+	{
+		tsfile_stop(PRIV->file);
+		/* what the stopped filter still had in its buffer is gone, too */
+		unsigned char tmp[4096];
+		while (recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT) > 0)
+			;
+		return true;
+	}
 	if (fd < 0)
 	{
 		hal_info("%s #%d: not open!\n", __FUNCTION__, num);
@@ -196,6 +304,13 @@ int cDemux::Read(unsigned char *buff, int len, int timeout)
 #endif
 	int rc;
 	struct pollfd ufds;
+	if (pdata && PRIV->live)
+	{
+		/* the engine reads this PID with the rest of the live stream */
+		if (timeout > 0)
+			usleep(timeout * 1000);
+		return 0;
+	}
 	ufds.fd = fd;
 	ufds.events = POLLIN | POLLPRI | POLLERR;
 	ufds.revents = 0;
@@ -378,6 +493,17 @@ bool cDemux::sectionFilter(unsigned short _pid, const unsigned char *const filte
 		fprintf(stderr, "\n");
 	}
 
+	if (pdata && PRIV->file)
+	{
+		tsfile_stop(PRIV->file);
+		unsigned char tmp[4096];
+		while (recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT) > 0)
+			;
+		tsfile_set_section(PRIV->file, pid, s_flt.filter.filter, s_flt.filter.mask,
+				   s_flt.filter.mode, DMX_FILTER_SIZE, s_flt.flags & DMX_CHECK_CRC);
+		return true;
+	}
+
 	ioctl(fd, DMX_STOP);
 	if (ioctl(fd, DMX_SET_FILTER, &s_flt) < 0)
 		return false;
@@ -400,6 +526,20 @@ bool cDemux::pesFilter(const unsigned short _pid)
 		return false;
 
 	hal_debug("%s #%d pid: 0x%04hx fd: %d type: %s\n", __FUNCTION__, num, pid, fd, DMX_T[dmx_type]);
+
+	if (pdata && PRIV->live)
+	{
+		live_lock.lock();
+		live_pid[live_index(dmx_type)] = pid;
+		live_lock.unlock();
+		return true;
+	}
+	if (pdata && PRIV->file)
+	{
+		pesfds.clear();
+		tsfile_set_pid(PRIV->file, pid, dmx_type == DMX_PES_CHANNEL);
+		return true;
+	}
 
 	memset(&p_flt, 0, sizeof(p_flt));
 	p_flt.pid = pid;
@@ -472,6 +612,11 @@ bool cDemux::addPid(unsigned short Pid)
 	pfd.fd = fd; /* dummy */
 	pfd.pid = Pid;
 	pesfds.push_back(pfd);
+	if (pdata && PRIV->file)
+	{
+		tsfile_add_pid(PRIV->file, Pid);
+		return true;
+	}
 	ret = (ioctl(fd, DMX_ADD_PID, &Pid));
 	if (ret < 0)
 		hal_info("%s: DMX_ADD_PID (%m)\n", __func__);
@@ -490,7 +635,9 @@ void cDemux::removePid(unsigned short Pid)
 		if ((*i).pid == Pid)
 		{
 			hal_debug("removePid: removing demux fd %d pid 0x%04x\n", fd, Pid);
-			if (ioctl(fd, DMX_REMOVE_PID, Pid) < 0)
+			if (pdata && PRIV->file)
+				tsfile_remove_pid(PRIV->file, Pid);
+			else if (ioctl(fd, DMX_REMOVE_PID, Pid) < 0)
 				hal_info("%s: (DMX_REMOVE_PID, 0x%04hx): %m\n", __func__, Pid);
 			pesfds.erase(i);
 			return; /* TODO: what if the same PID is there multiple times */
@@ -502,7 +649,10 @@ void cDemux::removePid(unsigned short Pid)
 void cDemux::getSTC(int64_t *STC)
 {
 	int64_t pts = 0;
-	if (videoDecoder)
+	cMpvEngine *engine = HAL_live_mpv ? cMpvEngine::getInstance() : NULL;
+	if (engine)
+		pts = engine->livePts();
+	else if (videoDecoder)
 		pts = videoDecoder->GetPTS();
 	*STC = pts;
 }
