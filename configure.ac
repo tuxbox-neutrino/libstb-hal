@@ -37,43 +37,17 @@ AC_DISABLE_STATIC
 AC_SYS_LARGEFILE
 LT_INIT
 
-AC_ARG_ENABLE(clutter,
-	AS_HELP_STRING(--enable-clutter, use clutter instead of OpenGL),
-	,[enable_clutter=no])
-
-AM_CONDITIONAL(USE_CLUTTER,test "$enable_clutter" = "yes")
-AM_CONDITIONAL(USE_OPENGL,test "$enable_clutter" = "no")
-if test "$enable_clutter" = "yes"; then
-	AC_DEFINE(USE_CLUTTER,1,[use clutter instead of opengl])
-else
-	AC_DEFINE(USE_OPENGL,1,[use opengl instead of clutter])
-fi
-
-AC_ARG_ENABLE(gstreamer,
-	AS_HELP_STRING(--enable-gstreamer, use gstreamer 1.0 playback),
-	,[enable_gstreamer=no])
-
-AM_CONDITIONAL(ENABLE_GSTREAMER, test "$enable_gstreamer" = "yes")
-if test "$enable_gstreamer" = "yes"; then
-	AC_DEFINE(ENABLE_GSTREAMER, 1, [use gstreamer 1.0 playback])
-	PKG_CHECK_MODULES([GSTREAMER], [gstreamer-1.0])
-	PKG_CHECK_MODULES([GSTREAMER_AUDIO], [gstreamer-audio-1.0])
-	PKG_CHECK_MODULES([GSTREAMER_VIDEO], [gstreamer-video-1.0])
-	PKG_CHECK_MODULES([GSTREAMER_TAG], [gstreamer-tag-1.0])
-	PKG_CHECK_MODULES([GSTREAMER_PBUTILS], [gstreamer-pbutils-1.0])
-	PKG_CHECK_MODULES([GSTREAMER_MPEGTS], [gstreamer-mpegts-1.0])
-fi
-
-if test x$BOXTYPE = xgeneric -a x$BOXMODEL != xraspi; then
-	if test x"$enable_clutter" = xyes; then
-		PKG_CHECK_MODULES([CLUTTER], [clutter-1.0])
-	fi
+if test x$BOXTYPE = xgeneric; then
 	PKG_CHECK_MODULES([AVFORMAT], [libavformat >= 53.21.1])
 	PKG_CHECK_MODULES([AVCODEC], [libavcodec >= 54.28.0])
 	# don't know which version is exactly needed here...
 	PKG_CHECK_MODULES([AVUTIL], [libavutil])
 	PKG_CHECK_MODULES([SWSCALE], [libswscale])
 	PKG_CHECK_MODULES([SWRESAMPLE], [libswresample])
+	PKG_CHECK_MODULES([SDL3], [sdl3 >= 3.2.0])
+	PKG_CHECK_MODULES([GLES2], [glesv2])
+	PKG_CHECK_MODULES([MPV], [mpv >= 1.108])
+	PKG_CHECK_MODULES([DRM], [libdrm])
 fi
 
 AC_ARG_ENABLE(flv2mpeg4,
@@ -93,7 +67,6 @@ libarmbox/Makefile
 libdvbci/Makefile
 libeplayer3/Makefile
 libgeneric-pc/Makefile
-libraspi/Makefile
 tools/Makefile
 ])
 

@@ -22,19 +22,16 @@
 
 #ifndef __glfb_priv__
 #define __glfb_priv__
+#include <stdint.h>
 #include <OpenThreads/Mutex>
 #include <vector>
 #include <map>
-#if USE_OPENGL
-#include <GL/glew.h>
-#include <GL/freeglut.h>
-#include <GL/gl.h>
+#include <SDL3/SDL.h>
+#include <GLES2/gl2.h>
 #include <linux/fb.h> /* for screeninfo etc. */
-#endif
-#if USE_CLUTTER
-#include <clutter/clutter.h>
-#endif
 #include "glfb.h"
+#include "mpv_player.h"
+struct mpv_render_context;
 extern "C" {
 #include <libavutil/rational.h>
 }
@@ -59,11 +56,15 @@ class GLFbPC
 		void blit()
 		{
 			mState.blit = true;
+			wake();
 		};
 		fb_var_screeninfo getScreenInfo()
 		{
 			return si;
 		}
+		bool setOSDResolution(int x, int y);
+		/* the mode of the display, where the window owns it */
+		void setDisplayMode(int w, int h, float rate);
 		void setOutputFormat(AVRational a, int h, int c)
 		{
 			mOA = a;
@@ -97,49 +98,100 @@ class GLFbPC
 
 		std::vector<unsigned char> *osd_buf; /* silly bounce buffer */
 
-#if USE_OPENGL
-		std::map<unsigned char, int> mKeyMap;
-		std::map<int, int> mSpecialMap;
-#endif
-#if USE_CLUTTER
-		std::map<int, int> mKeyMap;
-#endif
+		std::map<SDL_Keycode, int> mKeyMap;
+		SDL_Window *mWindow;
+		SDL_GLContext mContext;
+		uint32_t mUserEvent; /* wakes the GL thread: blit() and mpv frames */
+		int mViewX; /* viewport offset in fullscreen mode */
+		int mViewY;
+		mpv_render_context *mRender;
+		GLuint mVideoFbo; /* mpv renders the video into this FBO ... */
+		GLuint mVideoTex; /* ... whose texture is drawn below the OSD */
+		int mVideoW;
+		int mVideoH;
+		bool mVideoValid; /* mpv has drawn a frame since the last video-params change */
+		bool mFramePending;
 		int input_fd;
 		int64_t last_apts;
 		void run();
 
-		static void rendercb(); /* callback for GLUT */
 		void render(); /* actual render function */
-#if USE_OPENGL
-		static void keyboardcb(unsigned char key, int x, int y);
-		static void specialcb(int key, int x, int y);
-		static void resizecb(int w, int h);
-		void checkReinit(int w, int h); /* e.g. in case window was resized */
-		void setupGLObjects(); /* PBOs, textures and stuff */
+		void pollEvents(); /* waits for SDL window, keyboard and wakeup events */
+		void handleKey(SDL_Keycode key);
+		void pushKey(int code);
+		int mOsdBox[4]; /* x0, y0, x1, y1 of what the OSD shows; empty when x1 <= x0 */
+		bool mDirect; /* what the log said last about how the video is drawn */
+		int mLastPig[4]; /* what the last picture on the screen was drawn with */
+		bool mLastDirect;
+		int mOsdW; /* the size the OSD texture has, the GL thread's copy */
+		int mOsdH;
+		bool mOsdResize;
+		int mWantW; /* display mode asked for with setDisplayMode() */
+		int mWantH;
+		float mWantRate;
+		bool mModeChange;
+		void applyDisplayMode(int w, int h, float rate, const char *who);
+		/* the video on a plane of the display controller, below the window
+		 * that then only carries the OSD (Raspberry Pi and other KMS
+		 * hardware that scans DRM PRIME frames itself) */
+		bool mPlaneOK; /* set up: mpv hands its frames to the primary plane */
+		bool mOnPlane; /* the video that is playing is on the plane */
+		int mDrmFd;
+		struct _drmModeAtomicReq *mPlaneReq; /* mpv adds the plane's properties here */
+		GLuint mPlaneFbo; /* mpv wants a target, only its size matters */
+		GLuint mPlaneTex;
+		int mPlaneFboW;
+		int mPlaneFboH;
+		double mMargins[4];
+		double mFit[2]; /* panscan and stretched aspect sent to mpv */
+		bool setupPlane(void *drm_params);
+		bool renderPlane();
+		void planeMargins();
+		int mWinW; /* the window in pixels, the viewport may be smaller */
+		int mWinH;
+		bool mTexStale; /* the video was drawn directly, mVideoTex has an old frame */
+		void drawOSD();
+		uint64_t osdChecksum();
+		uint64_t mOsdSum; /* of the OSD that is on the window's plane */
+		bool mPlaneRedraw;
+		bool directVideo(int w, int h);
+		bool renderDirect();
+		/* a gamepad as remote control: what is held down repeats */
+		int mPadKey; /* the key that repeats, 0 for none */
+		uint64_t mPadNext; /* SDL ticks of its next repeat */
+		int mPadAxis[SDL_GAMEPAD_AXIS_COUNT]; /* the key each stick axis and trigger holds */
+		void padPress(int code);
+		void padRelease(int code);
+		void padButton(int button, bool down);
+		void padAxis(int axis, int value);
+		void padRepeat();
+		static bool producesText(SDL_Keycode key);
+		void wake();
+		bool setupRender(); /* the libmpv render context, needs the GL context */
+		void teardownRender();
+		void renderVideo(const cMpvEngine::VideoParams &vp);
+		void restoreGLState();
+		static void renderUpdateCb(void *ctx);
+		bool setupGLObjects(); /* shaders, textures and stuff */
 		void releaseGLObjects();
 		void drawSquare(float size, float x_factor = 1); /* do not be square */
-#endif
-#if USE_CLUTTER
-		static bool keyboardcb(ClutterActor *actor, ClutterEvent *event, gpointer user_data);
-#endif
 
 		void initKeys(); /* setup key bindings for window */
-#if 0
-		void setupCtx(); /* create the window and make the context current */
-		void setupOSDBuffer(); /* create the OSD buffer */
-#endif
 
 		struct
 		{
 			int width; /* width and height, fixed for a framebuffer instance */
 			int height;
 			bool blit;
-#if USE_OPENGL
 			GLuint osdtex; /* holds the OSD texture */
-			GLuint pbo; /* PBO we use for transfer to texture */
 			GLuint displaytex; /* holds the display texture */
-			GLuint displaypbo;
-#endif
+			GLuint program; /* the GLES2 shader program */
+			GLint a_pos; /* vertex attribute: position */
+			GLint a_tex; /* vertex attribute: texture coordinate */
+			GLint u_scale; /* uniform: zoom / aspect scaling */
+			GLint u_xproj; /* uniform: orthographic x scaling */
+			GLint u_bgra; /* uniform: 1 swizzles the BGRA CPU buffers, 0 for the mpv texture */
+			float xproj;
 		} mState;
 
 		void bltOSDBuffer();

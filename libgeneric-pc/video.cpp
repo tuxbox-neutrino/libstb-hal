@@ -42,17 +42,15 @@ extern "C" {
 /* my own buf 2MB - UHD HEVC I-frames can be very large */
 #define DMX_BUF_SZ 0x200000
 
-#if USE_OPENGL
 #define VDEC_PIXFMT AV_PIX_FMT_RGB32
-#endif
-#if USE_CLUTTER
-#define VDEC_PIXFMT AV_PIX_FMT_BGR24
-#endif
 
 #include "video_lib.h"
 #include "dmx_hal.h"
 #include "glfb_priv.h"
+#include "mpv_player.h"
 #include "hal_debug.h"
+
+#include <mpv/client.h>
 #define hal_debug(args...) _hal_debug(HAL_DEBUG_VIDEO, this, args)
 #define hal_info(args...) _hal_info(HAL_DEBUG_VIDEO, this, args)
 #define hal_info_c(args...) _hal_info(HAL_DEBUG_VIDEO, NULL, args)
@@ -63,9 +61,18 @@ extern GLFbPC *glfb_priv;
 int system_rev = 0;
 
 extern bool HAL_nodec;
+extern bool HAL_live_mpv;
+/* for the read callback of the software decoder, which has no object */
+static volatile bool decoder_running = false;
 
 static uint8_t *dmxbuf;
 static int bufpos;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
+#define FRAME_IS_KEY(f) (((f)->flags & AV_FRAME_FLAG_KEY) != 0)
+#else
+#define FRAME_IS_KEY(f) ((f)->key_frame)
+#endif
+
 #if LIBAVCODEC_VERSION_INT > AV_VERSION_INT(58, 133, 100)
 static void get_packet_defaults(AVPacket *pkt)
 {
@@ -133,6 +140,7 @@ cVideo::cVideo(int, void *, void *, unsigned int)
 	display_crop = DISPLAY_AR_MODE_LETTERBOX;
 	v_format = VIDEO_FORMAT_MPEG2;
 	output_h = 0;
+	v_std_set = false;
 	stillpicture = false;
 }
 
@@ -161,14 +169,28 @@ int cVideo::getAspectRatio(void)
 	int ret = 0;
 	int w, h, ar;
 	AVRational a;
-	if (buf_num == 0)
-		goto out;
-	a = buffers[buf_out].AR();
-	w = buffers[buf_out].width();
-	h = buffers[buf_out].height();
-	if (a.den == 0 || h == 0)
-		goto out;
-	ar = w * 100 * a.num / h / a.den;
+	if (HAL_live_mpv)
+	{
+		cMpvEngine *engine = cMpvEngine::getInstance();
+		cMpvEngine::VideoParams vp;
+		vp.valid = false;
+		if (engine)
+			vp = engine->getVideoParams();
+		if (!vp.valid || vp.aspect <= 0)
+			goto out;
+		ar = (int)(vp.aspect * 100);
+	}
+	else
+	{
+		if (buf_num == 0)
+			goto out;
+		a = buffers[buf_out].AR();
+		w = buffers[buf_out].width();
+		h = buffers[buf_out].height();
+		if (a.den == 0 || h == 0)
+			goto out;
+		ar = w * 100 * a.num / h / a.den;
+	}
 	if (ar < 100 || ar > 225) /* < 4:3, > 20:9 */
 		; /* ret = 0: N/A */
 	else if (ar < 140) /* 4:3 */
@@ -189,14 +211,40 @@ int cVideo::setCroppingMode(int)
 	return 0;
 }
 
+/* size and rate of the picture mpv is playing, where the software decoder kept its own */
+void cVideo::liveInfo(void)
+{
+	if (!HAL_live_mpv)
+		return;
+	cMpvEngine *engine = cMpvEngine::getInstance();
+	cMpvEngine::VideoParams vp;
+	vp.valid = false;
+	if (engine)
+		vp = engine->getVideoParams();
+	dec_w = vp.valid ? vp.sw : 0;
+	dec_h = vp.valid ? vp.sh : 0;
+	dec_r = vp.valid ? (int)(vp.fps + 0.01) : 0;
+}
+
 int cVideo::Start(void *, unsigned short, unsigned short, void *)
 {
 	hal_debug("%s running %d >\n", __func__, thread_running);
+	if (HAL_live_mpv)
+	{
+		cMpvEngine *engine = cMpvEngine::getInstance();
+		if (engine && !HAL_nodec)
+			engine->liveDecoder(true, true);
+		return 0;
+	}
 	if (!thread_running && !HAL_nodec)
 	{
 		thread_running = true;
+		decoder_running = true;
 		if (OpenThreads::Thread::start() != 0)
+		{
 			thread_running = false;
+			decoder_running = false;
+		}
 	}
 	hal_debug("%s running %d <\n", __func__, thread_running);
 	return 0;
@@ -205,9 +253,17 @@ int cVideo::Start(void *, unsigned short, unsigned short, void *)
 int cVideo::Stop(bool)
 {
 	hal_debug("%s running %d >\n", __func__, thread_running);
+	if (HAL_live_mpv)
+	{
+		cMpvEngine *engine = cMpvEngine::getInstance();
+		if (engine)
+			engine->liveDecoder(true, false);
+		return 0;
+	}
 	if (thread_running)
 	{
 		thread_running = false;
+		decoder_running = false;
 		OpenThreads::Thread::join();
 	}
 	hal_debug("%s running %d <\n", __func__, thread_running);
@@ -221,7 +277,14 @@ int cVideo::setBlank(int)
 
 int cVideo::GetVideoSystem()
 {
+	/* the system the output was set to, as the boxes with a real video
+	 * output report it; what is decoded says nothing about the display */
+	if (v_std_set)
+		return v_std;
+
 	int current_video_system = VIDEO_STD_1080I50;
+
+	liveInfo();
 
 	if (dec_w < 720)
 		current_video_system = VIDEO_STD_PAL;
@@ -233,39 +296,74 @@ int cVideo::GetVideoSystem()
 
 int cVideo::SetVideoSystem(int system, bool)
 {
-	int h;
+	int w, h;
+	float rate;
 	switch (system)
 	{
 		case VIDEO_STD_NTSC:
 		case VIDEO_STD_480P:
-			h = 480;
+			w = 720; h = 480; rate = 60;
 			break;
-		case VIDEO_STD_1080I60:
-		case VIDEO_STD_1080I50:
-		case VIDEO_STD_1080P30:
-		case VIDEO_STD_1080P24:
-		case VIDEO_STD_1080P25:
-		case VIDEO_STD_1080P50:
-			h = 1080;
-			break;
-		case VIDEO_STD_720P50:
-		case VIDEO_STD_720P60:
-			h = 720;
-			break;
-		case VIDEO_STD_AUTO:
-			hal_info("%s: VIDEO_STD_AUTO not implemented\n", __func__);
-		// fallthrough
 		case VIDEO_STD_SECAM:
 		case VIDEO_STD_PAL:
 		case VIDEO_STD_576P:
-			h = 576;
+			w = 720; h = 576; rate = 50;
 			break;
+		case VIDEO_STD_720P50:
+			w = 1280; h = 720; rate = 50;
+			break;
+		case VIDEO_STD_720P60:
+			w = 1280; h = 720; rate = 60;
+			break;
+		/* there is no interlaced output here, 1080i is 1080p at the same rate */
+		case VIDEO_STD_1080I50:
+		case VIDEO_STD_1080P50:
+			w = 1920; h = 1080; rate = 50;
+			break;
+		case VIDEO_STD_1080I60:
+		case VIDEO_STD_1080P60:
+			w = 1920; h = 1080; rate = 60;
+			break;
+		case VIDEO_STD_1080P24:
+			w = 1920; h = 1080; rate = 24;
+			break;
+		case VIDEO_STD_1080P2397:
+			w = 1920; h = 1080; rate = 23.976;
+			break;
+		case VIDEO_STD_1080P25:
+			w = 1920; h = 1080; rate = 25;
+			break;
+		case VIDEO_STD_1080P30:
+			w = 1920; h = 1080; rate = 30;
+			break;
+		case VIDEO_STD_1080P2997:
+			w = 1920; h = 1080; rate = 29.97;
+			break;
+		case VIDEO_STD_2160P24:
+			w = 3840; h = 2160; rate = 24;
+			break;
+		case VIDEO_STD_2160P25:
+			w = 3840; h = 2160; rate = 25;
+			break;
+		case VIDEO_STD_2160P30:
+			w = 3840; h = 2160; rate = 30;
+			break;
+		case VIDEO_STD_2160P50:
+			w = 3840; h = 2160; rate = 50;
+			break;
+		case VIDEO_STD_AUTO:
+			hal_info("%s: VIDEO_STD_AUTO not implemented\n", __func__);
+			return 0;
 		default:
 			hal_info("%s: unhandled value %d\n", __func__, system);
 			return 0;
 	}
-//	v_std = (VIDEO_STD) system;
+	hal_info("%s: %d -> %dx%d at %.2f Hz\n", __func__, system, w, h, rate);
+	v_std = (VIDEO_STD) system;
+	v_std_set = true;
 	output_h = h;
+	/* where the window owns the display, this is its mode from now on */
+	glfb_priv->setDisplayMode(w, h, rate);
 	if (display_aspect < DISPLAY_AR_RAW && output_h > 0) /* don't know what to do with this */
 		glfb_priv->setOutputFormat(aspect_ratios[display_aspect], output_h, display_crop);
 	return 0;
@@ -482,6 +580,7 @@ void cVideo::Pig(int x, int y, int w, int h, int /*osd_w*/, int /*osd_h*/, int /
 
 void cVideo::getPictureInfo(int &width, int &height, int &rate)
 {
+	liveInfo();
 	width = dec_w;
 	height = dec_h;
 	switch (dec_r)
@@ -549,6 +648,9 @@ static int my_read(void *, uint8_t *buf, int buf_size)
 			int ret = videoDemux->Read(dmxbuf + bufpos, DMX_BUF_SZ - bufpos, 20);
 			if (ret > 0)
 				bufpos += ret;
+			/* a stop must not wait for all the retries */
+			if (!decoder_running)
+				break;
 		}
 	}
 	if (bufpos == 0)
@@ -796,7 +898,7 @@ void cVideo::run(void)
 			if (frame_count <= 30)
 				hal_info("%s: frame #%d type=%c key=%d %dx%d pts=%" PRId64
 					" dts=%" PRId64 " fmt=%d buf_num=%d\n",
-					__func__, frame_count, pt, frame->key_frame,
+					__func__, frame_count, pt, FRAME_IS_KEY(frame),
 					c->width, c->height,
 					frame->best_effort_timestamp,
 					frame->pkt_dts,
@@ -813,7 +915,7 @@ void cVideo::run(void)
 			     all references are clean, normal decoding. */
 			if (keyframe_count < 2)
 			{
-				if (frame->key_frame || frame->pict_type == AV_PICTURE_TYPE_I)
+				if (FRAME_IS_KEY(frame) || frame->pict_type == AV_PICTURE_TYPE_I)
 				{
 					keyframe_count++;
 					if (keyframe_count == 1)
@@ -925,7 +1027,6 @@ void cVideo::run(void)
 				if (vpts != AV_NOPTS_VALUE && vpts >= 0)
 					last_pts = vpts;
 				/* a/v delay - reduced from 400ms/300ms to minimize offset */
-#if USE_OPENGL
 				if (vpts != AV_NOPTS_VALUE && vpts >= 0)
 				{
 					if (v_format == VIDEO_FORMAT_MPEG2)
@@ -933,15 +1034,6 @@ void cVideo::run(void)
 					else
 						vpts += 90000 * 15 / 100; /* 150ms */
 				}
-#endif
-#if USE_CLUTTER
-				/* no idea why there's a difference between OpenGL and clutter rendering... */
-				if (vpts != AV_NOPTS_VALUE && vpts >= 0)
-				{
-					if (v_format == VIDEO_FORMAT_MPEG2)
-						vpts += 90000 * 3 / 10; /* 300ms */
-				}
-#endif
 				f->pts(vpts);
 				AVRational a = av_guess_sample_aspect_ratio(avfc, avfc->streams[video_stream_idx], frame);
 				f->AR(a);
@@ -966,8 +1058,8 @@ void cVideo::run(void)
 				}
 				buf_m.unlock();
 			}
-			hal_debug("%s: time_base: %d/%d, ticks: %d rate: %d pts 0x%" PRIx64 "\n",
-				__func__, c->time_base.num, c->time_base.den, c->ticks_per_frame, dec_r,
+			hal_debug("%s: time_base: %d/%d, rate: %d pts 0x%" PRIx64 "\n",
+				__func__, c->time_base.num, c->time_base.den, dec_r,
 #if (LIBAVUTIL_VERSION_MAJOR < 54)
 				av_frame_get_best_effort_timestamp(frame)
 #else
@@ -1087,7 +1179,68 @@ bool cVideo::GetScreenImage(unsigned char *&data, int &xres, int &yres, bool get
 	int osd_h = glfb_priv->getOSDHeight();
 	xres = osd_w;
 	yres = osd_h;
-	if (get_video)
+	cMpvEngine *engine = cMpvEngine::getInstance();
+	if (get_video && engine && engine->getVideoParams().valid)
+	{
+		/* mpv has the picture: ask it for the frame, scaled to its display
+		 * size. It comes as bgr0, which is this buffer's RGB32 without alpha. */
+		mpv_node res;
+		mpv_node args[2];
+		args[0].format = MPV_FORMAT_STRING;
+		args[0].u.string = (char *)"screenshot-raw";
+		args[1].format = MPV_FORMAT_STRING;
+		args[1].u.string = (char *)"video";
+		mpv_node_list list;
+		list.num = 2;
+		list.values = args;
+		list.keys = NULL;
+		mpv_node cmd;
+		cmd.format = MPV_FORMAT_NODE_ARRAY;
+		cmd.u.list = &list;
+		if (mpv_command_node(engine->getHandle(), &cmd, &res) >= 0)
+		{
+			int64_t w = 0, h = 0, stride = 0;
+			mpv_byte_array *ba = NULL;
+			if (res.format == MPV_FORMAT_NODE_MAP)
+			{
+				for (int i = 0; i < res.u.list->num; i++)
+				{
+					const char *key = res.u.list->keys[i];
+					mpv_node *v = &res.u.list->values[i];
+					if (!strcmp(key, "w") && v->format == MPV_FORMAT_INT64)
+						w = v->u.int64;
+					else if (!strcmp(key, "h") && v->format == MPV_FORMAT_INT64)
+						h = v->u.int64;
+					else if (!strcmp(key, "stride") && v->format == MPV_FORMAT_INT64)
+						stride = v->u.int64;
+					else if (!strcmp(key, "data") && v->format == MPV_FORMAT_BYTE_ARRAY)
+						ba = v->u.ba;
+				}
+			}
+			if (ba && w > 0 && h > 0 && stride >= w * 4 && (int64_t)ba->size >= stride * h)
+			{
+				video.resize(w * h * 4);
+				video.width(w);
+				video.height(h);
+				for (int64_t y = 0; y < h; y++)
+				{
+					uint32_t *dst = (uint32_t *)&video[y * w * 4];
+					memcpy(dst, (uint8_t *)ba->data + y * stride, w * 4);
+					for (int64_t x = 0; x < w; x++)
+						dst[x] |= 0xff000000;
+				}
+			}
+			mpv_free_node_contents(&res);
+		}
+		vid_w = video.width();
+		vid_h = video.height();
+		if (scale_to_video || !get_osd)
+		{
+			xres = vid_w;
+			yres = vid_h;
+		}
+	}
+	else if (get_video)
 	{
 		buf_m.lock();
 		video = buffers[buf_out];
@@ -1119,23 +1272,19 @@ bool cVideo::GetScreenImage(unsigned char *&data, int &xres, int &yres, bool get
 
 	if (get_video)
 	{
-#if USE_OPENGL //memcpy dont work with copy BGR24 to RGB32
 		if (vid_w != xres || vid_h != yres) /* scale video into data... */
 		{
-#endif
 			bool ret = swscale(&video[0], data, vid_w, vid_h, xres, yres, VDEC_PIXFMT);
 			if (!ret)
 			{
 				free(data);
 				return false;
 			}
-#if USE_OPENGL //memcpy dont work with copy BGR24 to RGB32
 		}
 		else /* get_video and no fancy scaling needed */
 		{
 			memcpy(data, &video[0], xres * yres * sizeof(uint32_t));
 		}
-#endif
 	}
 
 	if (get_osd && (osd_w != xres || osd_h != yres))
@@ -1190,6 +1339,11 @@ bool cVideo::GetScreenImage(unsigned char *&data, int &xres, int &yres, bool get
 int64_t cVideo::GetPTS(void)
 {
 	int64_t pts = 0;
+	if (HAL_live_mpv)
+	{
+		cMpvEngine *engine = cMpvEngine::getInstance();
+		return engine ? engine->livePts() : 0;
+	}
 	buf_m.lock();
 	if (buf_num != 0)
 		pts = buffers[buf_out].pts();

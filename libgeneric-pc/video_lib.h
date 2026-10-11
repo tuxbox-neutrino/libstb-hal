@@ -207,6 +207,7 @@ class cVideo : public OpenThreads::Thread
 		bool Pause(void);
 
 		int SetStreamType(VIDEO_FORMAT type);
+		VIDEO_FORMAT GetStreamType(void) { return v_format; }
 		bool ShowPicture(const char *fname);
 
 		void SetSyncMode(AVSYNC_TYPE mode);
@@ -234,6 +235,7 @@ class cVideo : public OpenThreads::Thread
 
 	private:
 		void run();
+		void liveInfo(void);
 		SWFramebuffer buffers[VDEC_MAXBUFS];
 		int dec_w, dec_h;
 		int dec_r;
@@ -241,6 +243,7 @@ class cVideo : public OpenThreads::Thread
 		bool thread_running;
 		VIDEO_FORMAT v_format;
 		VIDEO_STD v_std;
+		bool v_std_set;
 		OpenThreads::Mutex buf_m;
 		DISPLAY_AR display_aspect;
 		DISPLAY_AR_MODE display_crop;
