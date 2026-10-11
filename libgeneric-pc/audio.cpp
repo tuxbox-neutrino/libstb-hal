@@ -21,8 +21,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 
 #include "audio_lib.h"
+#include "mpv_player.h"
 #include "dmx_hal.h"
 #include "hal_debug.h"
 
@@ -40,8 +42,8 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libswresample/swresample.h>
 #include <libavcodec/avcodec.h>
-#include <ao/ao.h>
 }
+#include <SDL3/SDL.h>
 /* ffmpeg buf 2k */
 #define INBUF_SIZE 0x0800
 /* my own buf 16k */
@@ -56,8 +58,63 @@ extern bool HAL_nodec;
 
 static cAudio *gThiz = NULL;
 
-static ao_device *adevice = NULL;
-static ao_sample_format sformat;
+#define hal_info_c(args...) _hal_info(HAL_DEBUG_AUDIO, NULL, args)
+
+/* SDL3 audio streams, one for the PCM clips of the audio player and one for the live decoder */
+struct AudioSink
+{
+	SDL_AudioStream *stream;
+	SDL_AudioSpec spec;
+	int maxQueued; /* bytes; writes block above it, as libao's ao_play() did */
+};
+static AudioSink clip_sink = { NULL, { SDL_AUDIO_UNKNOWN, 0, 0 }, 0 };
+static AudioSink live_sink = { NULL, { SDL_AUDIO_UNKNOWN, 0, 0 }, 0 };
+static float sink_gain = 1.0;
+static bool sink_muted = false;
+
+static void sinkApplyGain(AudioSink &s)
+{
+	if (s.stream)
+		SDL_SetAudioStreamGain(s.stream, sink_muted ? 0.0 : sink_gain);
+}
+
+static bool sinkOpen(AudioSink &s, SDL_AudioFormat fmt, int ch, int rate, double queueSeconds)
+{
+	if (s.stream && s.spec.format == fmt && s.spec.channels == ch && s.spec.freq == rate)
+		return true;
+	if (s.stream)
+		SDL_DestroyAudioStream(s.stream);
+	s.spec.format = fmt;
+	s.spec.channels = ch;
+	s.spec.freq = rate;
+	s.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &s.spec, NULL, NULL);
+	if (!s.stream)
+	{
+		hal_info_c("%s: SDL_OpenAudioDeviceStream(ch %d rate %d fmt 0x%x): %s\n", __func__, ch, rate, fmt, SDL_GetError());
+		return false;
+	}
+	s.maxQueued = (int)(rate * ch * SDL_AUDIO_BYTESIZE(fmt) * queueSeconds);
+	sinkApplyGain(s);
+	SDL_ResumeAudioStreamDevice(s.stream);
+	hal_info_c("%s: ch %d rate %d fmt 0x%x\n", __func__, ch, rate, fmt);
+	return true;
+}
+
+static void sinkWrite(AudioSink &s, const void *buf, int size)
+{
+	if (!s.stream)
+		return;
+	SDL_PutAudioStreamData(s.stream, buf, size);
+	while (SDL_GetAudioStreamQueued(s.stream) > s.maxQueued)
+		usleep(2000);
+}
+
+static void sinkClose(AudioSink &s)
+{
+	if (s.stream)
+		SDL_DestroyAudioStream(s.stream);
+	s.stream = NULL;
+}
 
 static AVCodecContext *c = NULL;
 static AVCodecParameters *p = NULL;
@@ -81,17 +138,16 @@ cAudio::cAudio(void *, void *, void *)
 	bufpos = 0;
 	curr_pts = 0;
 	gThiz = this;
-	ao_initialize();
+	SDL_InitSubSystem(SDL_INIT_AUDIO);
 }
 
 cAudio::~cAudio(void)
 {
 	closeDevice();
 	free(dmxbuf);
-	if (adevice)
-		ao_close(adevice);
-	adevice = NULL;
-	ao_shutdown();
+	sinkClose(clip_sink);
+	sinkClose(live_sink);
+	SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }
 
 void cAudio::openDevice(void)
@@ -107,12 +163,27 @@ void cAudio::closeDevice(void)
 int cAudio::do_mute(bool enable, bool remember)
 {
 	hal_debug("%s(%d, %d)\n", __func__, enable, remember);
+	if (remember)
+		Muted = enable;
+	sink_muted = enable;
+	sinkApplyGain(clip_sink);
+	sinkApplyGain(live_sink);
+	cMpvEngine *e = cMpvEngine::getInstance();
+	if (e)
+		e->setFlag("mute", enable);
 	return 0;
 }
 
 int cAudio::setVolume(unsigned int left, unsigned int right)
 {
 	hal_debug("%s(%d, %d)\n", __func__, left, right);
+	volume = (left + right) / 2;
+	sink_gain = volume / 100.0;
+	sinkApplyGain(clip_sink);
+	sinkApplyGain(live_sink);
+	cMpvEngine *e = cMpvEngine::getInstance();
+	if (e)
+		e->setDouble("volume", volume);
 	return 0;
 }
 
@@ -161,53 +232,43 @@ int cAudio::setChannel(int /*channel*/)
 
 int cAudio::PrepareClipPlay(int ch, int srate, int bits, int le)
 {
-	hal_debug("%s ch %d srate %d bits %d le %d adevice %p\n", __func__, ch, srate, bits, le, adevice);;
-	int driver;
-	int byte_format = le ? AO_FMT_LITTLE : AO_FMT_BIG;
-	if (sformat.bits != bits || sformat.channels != ch || sformat.rate != srate || sformat.byte_format != byte_format || adevice == NULL)
+	hal_debug("%s ch %d srate %d bits %d le %d\n", __func__, ch, srate, bits, le);
+	SDL_AudioFormat fmt;
+	switch (bits)
 	{
-		driver = ao_default_driver_id();
-		sformat.bits = bits;
-		sformat.channels = ch;
-		sformat.rate = srate;
-		sformat.byte_format = byte_format;
-		sformat.matrix = 0;
-		if (adevice)
-			ao_close(adevice);
-		adevice = ao_open_live(driver, &sformat, NULL);
-		ao_info *ai = ao_driver_info(driver);
-		hal_info("%s: changed params ch %d srate %d bits %d le %d adevice %p\n", __func__, ch, srate, bits, le, adevice);;
-		hal_info("libao driver: %d name '%s' short '%s' author '%s'\n", driver, ai->name, ai->short_name, ai->author);
+		case 8:
+			fmt = SDL_AUDIO_U8;
+			break;
+		case 32:
+			fmt = le ? SDL_AUDIO_S32LE : SDL_AUDIO_S32BE;
+			break;
+		default:
+			fmt = le ? SDL_AUDIO_S16LE : SDL_AUDIO_S16BE;
+			break;
 	}
+	sinkOpen(clip_sink, fmt, ch, srate, 0.25);
 	return 0;
 };
 
 int cAudio::WriteClip(unsigned char *buffer, int size)
 {
 	hal_debug("cAudio::%s buf 0x%p size %d\n", __func__, buffer, size);
-	if (!adevice)
+	if (!clip_sink.stream)
 	{
-		hal_info("%s: adevice not opened?\n", __func__);
+		hal_info("%s: clip sink not opened?\n", __func__);
 		return 0;
 	}
-	ao_play(adevice, (char *)buffer, size);
+	sinkWrite(clip_sink, buffer, size);
 	return size;
 };
 
 int cAudio::StopClip()
 {
 	hal_debug("%s\n", __func__);
-#if 0
-	/* don't do anything - closing / reopening ao all the time makes for long delays
-	 * reinit on-demand (e.g. for changed parameters) instead */
-	if (!adevice)
-	{
-		hal_info("%s: adevice not opened?\n", __func__);
-		return 0;
-	}
-	ao_close(adevice);
-	adevice = NULL;
-#endif
+	/* the stream stays open, reopening it for every track costs time; what is
+	 * queued still plays out */
+	if (clip_sink.stream)
+		SDL_FlushAudioStream(clip_sink.stream);
 	return 0;
 };
 
@@ -379,12 +440,8 @@ void cAudio::run()
 	AVFrame *frame = NULL;
 	uint8_t *inbuf = (uint8_t *)av_malloc(INBUF_SIZE);
 	AVPacket avpkt;
-	int ret, driver;
+	int ret;
 	int av_ret = 0;
-	/* libao */
-	ao_info *ai;
-	// ao_device *adevice;
-	// ao_sample_format sformat;
 	/* resample */
 	SwrContext *swr = NULL;
 	uint8_t *obuf = NULL;
@@ -592,22 +649,7 @@ void cAudio::run()
 					av_channel_layout_copy(&o_chlayout, &in_chlayout);
 #endif
 				}
-				if (sformat.channels != o_ch || sformat.rate != o_sr || sformat.byte_format != AO_FMT_NATIVE || sformat.bits != 16 || adevice == NULL)
-				{
-					driver = ao_default_driver_id();
-					sformat.bits = 16;
-					sformat.channels = o_ch;
-					sformat.rate = o_sr;
-					sformat.byte_format = AO_FMT_NATIVE;
-					sformat.matrix = 0;
-					if (adevice)
-						ao_close(adevice);
-					adevice = ao_open_live(driver, &sformat, NULL);
-					ai = ao_driver_info(driver);
-					hal_info("%s: changed params ch %d srate %d bits %d adevice %p\n", __func__, o_ch, o_sr, 16, adevice);
-					if (ai)
-						hal_info("libao driver: %d name '%s' short '%s' author '%s'\n", driver, ai->name, ai->short_name, ai->author);
-				}
+				sinkOpen(live_sink, SDL_AUDIO_S16, o_ch, o_sr, 0.2);
 #if 0
 				hal_info(" driver options:");
 				for (int i = 0; i < ai->option_count; ++i)
@@ -662,11 +704,10 @@ void cAudio::run()
 			hal_debug("%s: pts 0x%" PRIx64 " %3f\n", __func__, curr_pts, curr_pts / 90000.0);
 			int o_buf_sz = av_samples_get_buffer_size(&out_linesize, o_ch, obuf_sz, AV_SAMPLE_FMT_S16, 1);
 			if (o_buf_sz > 0)
-				ao_play(adevice, (char *)obuf, o_buf_sz);
+				sinkWrite(live_sink, obuf, o_buf_sz);
 		}
 		av_packet_unref(&avpkt);
 	}
-	// ao_close(adevice); /* can take long :-( */
 	av_free(obuf);
 	swr_free(&swr);
 out3:

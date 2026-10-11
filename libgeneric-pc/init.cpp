@@ -4,6 +4,7 @@
 
 #include "init.h"
 #include "glfb.h"
+#include "mpv_player.h"
 
 #include "hal_debug.h"
 #define hal_debug(args...) _hal_debug(HAL_DEBUG_INIT, NULL, args)
@@ -13,15 +14,16 @@ static bool initialized = false;
 GLFramebuffer *glfb = NULL;
 bool HAL_nodec = false;
 
-#ifdef ENABLE_GSTREAMER
-extern void hal_gst_global_shutdown(void);
-#endif
 
 void hal_api_init()
 {
 	if (!initialized)
 		hal_debug_init();
 	hal_info("%s begin, initialized=%d, debug=0x%02x\n", __func__, (int)initialized, debuglevel);
+	/* the GL thread attaches its render context to the engine, so it has to exist first;
+	 * export HAL_NOMPV=1 to run without a player */
+	if (!getenv("HAL_NOMPV") && !cMpvEngine::getInstance())
+		hal_info("%s: libmpv engine not available, no playback\n", __func__);
 	if (! glfb)
 	{
 		int x = 1280, y = 720; /* default OSD FB resolution */
@@ -56,11 +58,9 @@ void hal_api_init()
 void hal_api_exit()
 {
 	hal_info("%s, initialized = %d\n", __func__, (int)initialized);
-#ifdef ENABLE_GSTREAMER
-	hal_gst_global_shutdown();
-#endif
 	if (glfb)
 		delete glfb;
 	glfb = NULL;
+	cMpvEngine::shutdown();
 	initialized = false;
 }

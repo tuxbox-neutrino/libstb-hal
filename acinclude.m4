@@ -143,11 +143,11 @@ AC_ARG_WITH(boxtype,
 	[BOXTYPE="generic"])
 
 AC_ARG_WITH(boxmodel,
-	AS_HELP_STRING([--with-boxmodel], [valid for generic: generic, raspi])
+	AS_HELP_STRING([--with-boxmodel], [valid for generic: generic])
 AS_HELP_STRING([], [valid for armbox: hd60, hd61, multibox, multiboxse, hd51, bre2ze4k, h7, e4hdultra, protek4k, osmini4k, osmio4k, osmio4kplus, vusolo4k, vuduo4k, vuduo4kse, vuultimo4k, vuuno4k, vuuno4kse, vuzero4k])
 AS_HELP_STRING([], [valid for mipsbox: vuduo, vuduo2, gb800se, osnino, osninoplus, osninopro]),
 	[case "${withval}" in
-		generic|raspi)
+		generic)
 			if test "$BOXTYPE" = "generic"; then
 				BOXMODEL="$withval"
 			else
@@ -183,7 +183,6 @@ AM_CONDITIONAL(BOXTYPE_MIPSBOX, test "$BOXTYPE" = "mipsbox")
 
 # generic
 AM_CONDITIONAL(BOXMODEL_GENERIC, test "$BOXMODEL" = "generic")
-AM_CONDITIONAL(BOXMODEL_RASPI, test "$BOXMODEL" = "raspi")
 
 # armbox
 AM_CONDITIONAL(BOXMODEL_HD60, test "$BOXMODEL" = "hd60")
@@ -230,8 +229,6 @@ fi
 # generic
 if test "$BOXMODEL" = "generic"; then
 	AC_DEFINE(BOXMODEL_GENERIC, 1, [generic pc])
-elif test "$BOXMODEL" = "raspi"; then
-	AC_DEFINE(BOXMODEL_RASPI, 1, [raspberry pi])
 
 # armbox
 elif test "$BOXMODEL" = "hd60"; then

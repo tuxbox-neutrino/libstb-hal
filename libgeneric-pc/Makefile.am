@@ -6,23 +6,23 @@ AM_CPPFLAGS += \
 	-I$(top_srcdir)/common \
 	-I$(top_srcdir)/include \
 	@AVUTIL_CFLAGS@ \
-	@CLUTTER_CFLAGS@
+	@SDL3_CFLAGS@ \
+	@GLES2_CFLAGS@ \
+	@MPV_CFLAGS@
 
 AM_CXXFLAGS = -fno-rtti -fno-exceptions -fno-strict-aliasing
 
 AM_LDFLAGS = \
-	-lao -lrt \
+	-lrt \
 	-lOpenThreads \
 	@AVFORMAT_LIBS@ \
 	@AVUTIL_LIBS@ \
 	@AVCODEC_LIBS@ \
 	@SWRESAMPLE_LIBS@ \
 	@SWSCALE_LIBS@ \
-	@CLUTTER_LIBS@
-
-if USE_OPENGL
-AM_LDFLAGS += -lglut -lGL -lGLU -lGLEW -lao
-endif
+	@SDL3_LIBS@ \
+	@GLES2_LIBS@ \
+	@MPV_LIBS@
 
 libgeneric_la_SOURCES = \
 	hardware_caps.c \
@@ -30,35 +30,7 @@ libgeneric_la_SOURCES = \
 	video.cpp \
 	audio.cpp \
 	init.cpp \
-	record.cpp
-
-if USE_CLUTTER
-libgeneric_la_SOURCES += clutterfb.cpp
-endif
-if USE_OPENGL
-libgeneric_la_SOURCES += glfb.cpp
-endif
-
-if ENABLE_GSTREAMER
-AM_CPPFLAGS += \
-	@GSTREAMER_CFLAGS@ \
-	@GSTREAMER_AUDIO_CFLAGS@ \
-	@GSTREAMER_VIDEO_CFLAGS@ \
-	@GSTREAMER_TAG_CFLAGS@ \
-	@GSTREAMER_PBUTILS_CFLAGS@ \
-	@GSTREAMER_MPEGTS_CFLAGS@
-
-AM_LDFLAGS += \
-	@GSTREAMER_LIBS@ \
-	@GSTREAMER_AUDIO_LIBS@ \
-	@GSTREAMER_VIDEO_LIBS@ \
-	@GSTREAMER_TAG_LIBS@ \
-	@GSTREAMER_PBUTILS_LIBS@ \
-	@GSTREAMER_MPEGTS_LIBS@
-
-libgeneric_la_SOURCES += \
-	playback_gst.cpp
-else
-libgeneric_la_SOURCES += \
-	playback.cpp
-endif
+	record.cpp \
+	glfb.cpp \
+	mpv_player.cpp \
+	playback_mpv.cpp

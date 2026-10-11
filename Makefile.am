@@ -13,15 +13,9 @@ libstb_hal_la_LIBADD = \
 
 # there has to be a better way to do this...
 if BOXTYPE_GENERIC
-if BOXMODEL_RASPI
-SUBDIRS += libraspi
-libstb_hal_la_LIBADD += \
-	libraspi/libraspi.la
-else
 SUBDIRS += libgeneric-pc
 libstb_hal_la_LIBADD += \
 	libgeneric-pc/libgeneric.la
-endif
 endif
 
 if BOXTYPE_ARMBOX
