@@ -114,6 +114,7 @@ class GLFbPC
 		static void keyboardcb(unsigned char key, int x, int y);
 		static void specialcb(int key, int x, int y);
 		static void resizecb(int w, int h);
+		static void shutdowncb(int value); /* leaves the loop on shutdown, window visible or not */
 		void checkReinit(int w, int h); /* e.g. in case window was resized */
 		void setupGLObjects(); /* PBOs, textures and stuff */
 		void releaseGLObjects();

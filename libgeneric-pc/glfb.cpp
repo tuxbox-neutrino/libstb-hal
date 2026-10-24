@@ -207,6 +207,9 @@ void GLFbPC::initKeys()
 	mKeyMap['W'] = KEY_WWW;
 }
 
+/* how often the GL thread looks for a shutdown when nothing else wakes it */
+static const unsigned int shutdown_poll_ms = 100;
+
 void GLFramebuffer::run()
 {
 	int argc = 1;
@@ -243,6 +246,7 @@ void GLFramebuffer::run()
 			glutKeyboardFunc(GLFbPC::keyboardcb);
 			glutSpecialFunc(GLFbPC::specialcb);
 			glutReshapeFunc(GLFbPC::resizecb);
+			glutTimerFunc(shutdown_poll_ms, GLFbPC::shutdowncb, 0);
 			glfb_priv->setupGLObjects(); /* needs GLEW prototypes */
 			glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_CONTINUE_EXECUTION);
 			glutMainLoop();
@@ -506,6 +510,18 @@ void GLFbPC::render()
 /* static */ void GLFbPC::resizecb(int w, int h)
 {
 	glfb_priv->checkReinit(w, h);
+}
+
+/* static */ void GLFbPC::shutdowncb(int /*value*/)
+{
+	/* render() leaves the loop on shutdown, but GLUT does not call it while
+	 * the window is not visible, e.g. minimized. glutMainLoop() then sleeps
+	 * until the next window event, and the destructor's join() never
+	 * returns. A timer runs whether the window is visible or not. */
+	if (glfb_priv->mShutDown)
+		glutLeaveMainLoop();
+	else
+		glutTimerFunc(shutdown_poll_ms, GLFbPC::shutdowncb, 0);
 }
 
 void GLFbPC::checkReinit(int x, int y)
