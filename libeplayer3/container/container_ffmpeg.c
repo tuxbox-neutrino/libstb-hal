@@ -165,6 +165,7 @@ static int64_t calcPts(uint32_t avContextIdx, AVStream *stream, int64_t pts);
 static int64_t doCalcPts(int64_t start_time, const AVRational time_base, int64_t pts);
 void LinuxDvbBuffSetStamp(void *stamp);
 static int32_t container_ffmpeg_stop(Context_t *context);
+static void container_ffmpeg_release(void);
 static int32_t isHlsInput(const AVFormatContext *ctx);
 static int hls_ad_debug_enabled(void);
 static int hls_ad_debug_uri_matches(const char *uri);
@@ -2025,7 +2026,6 @@ static void FFMPEGThread(Context_t *context)
 	mpeg4p2_context_close(mpeg4p2_context);
 #endif
 
-	hasPlayThreadStarted = 0;
 	context->playback->isPlaying = 0;
 	seek_target_seconds = 0;
 	do_seek_target_seconds = 0;
@@ -2033,9 +2033,12 @@ static void FFMPEGThread(Context_t *context)
 
 	if (context && context->playback)
 	{
-		container_ffmpeg_stop(context);
+		container_ffmpeg_release();
 	}
 
+	/* Cleared last: container_ffmpeg_stop() waits for this, so it returns
+	 * only once this thread is done with avContextTab[]. */
+	hasPlayThreadStarted = 0;
 	ffmpeg_printf(10, "terminating\n");
 }
 
@@ -3520,6 +3523,8 @@ static int32_t container_ffmpeg_play(Context_t *context)
 		pthread_attr_init(&attr);
 		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
+		/* set before the thread runs, it clears the flag as its last step */
+		hasPlayThreadStarted = 1;
 		if ((error = pthread_create(&PlayThread, &attr, (void *)&FFMPEGThread, context)) != 0)
 		{
 			ffmpeg_printf(10, "Error creating thread, error:%d:%s\n", error, strerror(error));
@@ -3529,7 +3534,6 @@ static int32_t container_ffmpeg_play(Context_t *context)
 		else
 		{
 			ffmpeg_printf(10, "Created thread\n");
-			hasPlayThreadStarted = 1;
 		}
 	}
 	else
@@ -3578,6 +3582,16 @@ static int32_t container_ffmpeg_stop(Context_t *context)
 	}
 
 	hasPlayThreadStarted = 0;
+	container_ffmpeg_release();
+
+	ffmpeg_printf(10, "ret %d\n", ret);
+	return ret;
+}
+
+/* Frees what the player thread worked on. The thread calls this on its way
+ * out, container_ffmpeg_stop() once the thread has ended. */
+static void container_ffmpeg_release(void)
+{
 	terminating = 1;
 
 	getMutex(__FILE__, __FUNCTION__, __LINE__);
@@ -3633,9 +3647,6 @@ static int32_t container_ffmpeg_stop(Context_t *context)
 	ffmpeg_buf_free();
 
 	releaseMutex(__FILE__, __FUNCTION__, __LINE__);
-
-	ffmpeg_printf(10, "ret %d\n", ret);
-	return ret;
 }
 
 static int32_t container_ffmpeg_seek_bytes(off_t pos)
