@@ -37,6 +37,8 @@ int system_rev = 0;
 cVideo::cVideo(int, void *, void *, unsigned int)
 {
 	hal_debug("%s\n", __func__);
+	thread_running = false;
+	dec_w = dec_h = dec_r = 0;
 	display_aspect = DISPLAY_AR_16_9;
 	display_crop = DISPLAY_AR_MODE_LETTERBOX;
 	v_format = VIDEO_FORMAT_MPEG2;
