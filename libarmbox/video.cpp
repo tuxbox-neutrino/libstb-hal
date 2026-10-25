@@ -1366,9 +1366,20 @@ static bool swscale(unsigned char *src, unsigned char *dst, int sw, int sh, int 
 }
 
 // grabing the osd picture
+/* The framebuffer under the name udev gives it, then under the devfs name
+   this code first used. The images of this tree have only /dev/fb0, /dev/fb
+   being a link to it, so no screenshot carried the OSD. */
+static int open_osd_fb(int flags)
+{
+	int fb = open("/dev/fb0", flags);
+	if (fb == -1)
+		fb = open("/dev/fb/0", flags);
+	return fb;
+}
+
 void get_osd_size(int &xres, int &yres, int &bits_per_pixel)
 {
-	int fb = open("/dev/fb/0", O_RDWR);
+	int fb = open_osd_fb(O_RDONLY);
 	if (fb == -1)
 	{
 		fprintf(stderr, "Framebuffer failed\n");
@@ -1390,12 +1401,15 @@ void get_osd_size(int &xres, int &yres, int &bits_per_pixel)
 	fprintf(stderr, "... Framebuffer-Size: %d x %d\n", xres, yres);
 
 }
-void get_osd_buf(unsigned char *osd_data)
+/* osd_data holds want_w * want_h pixels, sized from an earlier read of the
+   mode: a mode neutrino changed since then is not copied, and the page
+   stays as it was handed in. */
+void get_osd_buf(unsigned char *osd_data, int want_w, int want_h)
 {
 	struct fb_fix_screeninfo fix_screeninfo;
 	struct fb_var_screeninfo var_screeninfo;
 
-	int fb = open("/dev/fb/0", O_RDONLY);
+	int fb = open_osd_fb(O_RDONLY);
 	if (fb == -1)
 	{
 		fprintf(stderr, "Framebuffer failed\n");
@@ -1427,8 +1441,16 @@ void get_osd_buf(unsigned char *osd_data)
 	if (var_screeninfo.bits_per_pixel == 32)
 	{
 		fprintf(stderr, "Grabbing 32bit Framebuffer ...\n");
-		// get 32bit framebuffer
-		memcpy(osd_data, lfb, fix_screeninfo.line_length * var_screeninfo.yres);
+		/* Row by row from the page on display: a line can be longer than
+		   the picture is wide, and osd_data holds xres * yres pixels and no
+		   more, which one copy of line_length * yres bytes overran. */
+		const size_t row = (size_t) var_screeninfo.xres * 4;
+		const size_t end = (size_t) (var_screeninfo.yoffset + var_screeninfo.yres) * fix_screeninfo.line_length;
+		if ((int) var_screeninfo.xres == want_w && (int) var_screeninfo.yres == want_h &&
+		    fix_screeninfo.line_length >= row && end <= fix_screeninfo.smem_len)
+			for (unsigned int y = 0; y < var_screeninfo.yres; y++)
+				memcpy(osd_data + y * row,
+				       (unsigned char *) lfb + (size_t) (var_screeninfo.yoffset + y) * fix_screeninfo.line_length, row);
 	}
 
 	if (munmap(lfb, fix_screeninfo.smem_len) == -1)
@@ -1450,7 +1472,7 @@ inline void rgb24torgb32(unsigned char *src, unsigned char *dest, int picsize)
 	}
 }
 
-/* TODO: aspect ratio correction and PIP */
+/* TODO: PIP */
 bool cVideo::GetScreenImage(unsigned char *&out_data, int &xres, int &yres, bool get_video, bool get_osd, bool scale_to_video)
 {
 #define VDEC_PIXFMT AV_PIX_FMT_BGR24
@@ -1481,6 +1503,25 @@ bool cVideo::GetScreenImage(unsigned char *&out_data, int &xres, int &yres, bool
 			yres = osd_h;
 		}
 	}
+	/* The grab below is the picture as it is displayed, and the decoded size
+	   of an SD picture is 720 x 576 whatever its shape: a picture of the
+	   video's size takes its width from the aspect the decoder reports (the
+	   codes neutrino reads: 1 4:3, 2 14:9, 3 16:9, 4 20:9, 5 2.21:1), or else
+	   it came out squeezed. A code it does not know leaves the decoded width.
+	   Only with the decoder open: in the movie player getAspectRatio() hands
+	   on the value of /proc/stb/vmpeg/0/aspect as it stands, which is not
+	   known to be in these codes. */
+	if (get_video && fd != -1 && (!get_osd || scale_to_video))
+	{
+		static const struct { int code, num, den; } shape[] =
+		{
+			{ 1, 4, 3 }, { 2, 14, 9 }, { 3, 16, 9 }, { 4, 20, 9 }, { 5, 221, 100 }
+		};
+		for (size_t i = 0; i < sizeof(shape) / sizeof(shape[0]); i++)
+			if (aspect == shape[i].code)
+				xres = (yres * shape[i].num / shape[i].den + 1) & ~1;
+	}
+
 	unsigned char *osd_data = NULL;
 	out_data = (unsigned char *)malloc(xres * yres * 4);/* will be freed by caller */
 	if (out_data == NULL)
@@ -1518,9 +1559,10 @@ bool cVideo::GetScreenImage(unsigned char *&out_data, int &xres, int &yres, bool
 
 	if (get_osd)
 	{
-		osd_data = (unsigned char *)malloc(osd_w * osd_h * 4);
+		// cleared, so a page the copy below cannot read is transparent
+		osd_data = (unsigned char *)calloc(osd_w * osd_h, 4);
 		if (osd_data)
-			get_osd_buf(osd_data);
+			get_osd_buf(osd_data, osd_w, osd_h);
 	}
 
 	if (get_osd && (osd_w != xres || osd_h != yres))
