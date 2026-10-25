@@ -2739,6 +2739,33 @@ int32_t container_ffmpeg_init(Context_t *context, PlayFiles_t *playFilesNames)
 		ffmpeg_printf(10, "second filename %s\n", playFilesNames->szSecondFile);
 	}
 
+	/* container_ffmpeg_stop() gives up on the player thread after 5 s, for
+	 * instance while it waits in a name lookup ffmpeg cannot interrupt. That
+	 * thread works on avContextTab[] until it clears hasPlayThreadStarted,
+	 * so nothing may be opened before. A thread on its way out gets a
+	 * second; a stuck one gets the stop request and ends once the lookup
+	 * returns. */
+	int32_t wait_time = 100;
+	while (hasPlayThreadStarted && (--wait_time) > 0)
+	{
+		usleep(10000);
+	}
+
+	if (hasPlayThreadStarted)
+	{
+		char error[512];
+		int32_t err = AVERROR(EBUSY);
+
+		av_strerror(err, error, sizeof(error));
+		printf("{\"log\":\"Player thread of the previous stream still running, not opening '%s'\"}\n", playFilesNames->szFirstFile);
+		context->playback->lastOpenErrorCode = err;
+		strncpy(context->playback->lastOpenErrorMessage, error, PLAYBACK_LAST_ERROR_MSG_SIZE - 1);
+		context->playback->lastOpenErrorMessage[PLAYBACK_LAST_ERROR_MSG_SIZE - 1] = '\0';
+		E2iSendMsg("{\"FF_ERROR\":{\"msg\":\"%s\",\"code\":%i}}\n", error, err);
+		PlaybackDieNow(1);
+		return cERR_CONTAINER_FFMPEG_ERR;
+	}
+
 	/* initialize ffmpeg */
 	wrapped_register_all();
 	avformat_network_init();
@@ -2752,6 +2779,12 @@ int32_t container_ffmpeg_init(Context_t *context, PlayFiles_t *playFilesNames)
 	//av_log_set_callback(ffmpeg_silen_callback);
 #endif
 
+	/* A stop request ends one stream, not the next one. The player thread
+	 * of the stopped stream raises it again on its way out; if that thread
+	 * outlived container_ffmpeg_stop(), this happens after PlaybackClose()
+	 * cleared it, nothing would clear it again, and interrupt_cb() would
+	 * end every later open at once with AVERROR_EXIT. */
+	PlaybackDieNow(2);
 	context->playback->abortRequested = 0;
 	int32_t res = container_ffmpeg_init_av_context(context, playFilesNames->szFirstFile, playFilesNames->iFirstFileSize, \
 		playFilesNames->szFirstMoovAtomFile, playFilesNames->iFirstMoovAtomOffset, 0);
