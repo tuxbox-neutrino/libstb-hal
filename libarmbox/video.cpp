@@ -657,8 +657,16 @@ int cVideo::getAspectRatio(void)
 	video_size_t s;
 	if (fd == -1)
 	{
-		/* in movieplayer mode, fd is not opened -> fall back to procfs */
+		/* in movieplayer mode, fd is not opened -> fall back to procfs. The
+		   file holds the display aspect in the codes of an MPEG sequence
+		   header, 2 for 4:3, 3 for 16:9 and 4 for 2.21:1 (read on an H7 with
+		   4:3 and 16:9 films, MPEG-2 and H.264), where the ioctl below gives
+		   1, 3 and 5: told in those, as every reader of this expects them. */
 		int n = proc_get_hex(VMPEG_aspect[devnum]);
+		if (n == 2)
+			return 1;
+		if (n == 4)
+			return 5;
 		return n;
 	}
 	if (fop(ioctl, VIDEO_GET_SIZE, &s) < 0)
@@ -1508,9 +1516,9 @@ bool cVideo::GetScreenImage(unsigned char *&out_data, int &xres, int &yres, bool
 	   video's size takes its width from the aspect the decoder reports (the
 	   codes neutrino reads: 1 4:3, 2 14:9, 3 16:9, 4 20:9, 5 2.21:1), or else
 	   it came out squeezed. A code it does not know leaves the decoded width.
-	   Only with the decoder open: in the movie player getAspectRatio() hands
-	   on the value of /proc/stb/vmpeg/0/aspect as it stands, which is not
-	   known to be in these codes. */
+	   Only with the decoder open: in the movie player getAspectRatio() reads
+	   /proc/stb/vmpeg/0/aspect, whose codes were read on an H7 alone, and the
+	   ARM boxes with another chip may fill that file differently. */
 	if (get_video && fd != -1 && (!get_osd || scale_to_video))
 	{
 		static const struct { int code, num, den; } shape[] =
