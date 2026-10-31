@@ -2758,8 +2758,7 @@ int32_t container_ffmpeg_init(Context_t *context, PlayFiles_t *playFilesNames)
 		av_strerror(err, error, sizeof(error));
 		printf("{\"log\":\"Player thread of the previous stream still running, not opening '%s'\"}\n", playFilesNames->szFirstFile);
 		context->playback->lastOpenErrorCode = err;
-		strncpy(context->playback->lastOpenErrorMessage, error, PLAYBACK_LAST_ERROR_MSG_SIZE - 1);
-		context->playback->lastOpenErrorMessage[PLAYBACK_LAST_ERROR_MSG_SIZE - 1] = '\0';
+		snprintf(context->playback->lastOpenErrorMessage, PLAYBACK_LAST_ERROR_MSG_SIZE, "%s", error);
 		E2iSendMsg("{\"FF_ERROR\":{\"msg\":\"%s\",\"code\":%i}}\n", error, err);
 		PlaybackDieNow(1);
 		return cERR_CONTAINER_FFMPEG_ERR;
